@@ -1,0 +1,7 @@
+{
+  "name": "홍차 테스트스위치",
+  "roomId": "6c9494fc-3ecb-40da-8500-1b8401362290",
+  "prototype": "VIRTUAL_SWITCH",
+  "executionTarget": "CLOUD",
+  "owner": { "ownerType": "LOCATION", "ownerId": "5304bc94-d91f-4b89-a09a-d0c093eab7c1" }
+}

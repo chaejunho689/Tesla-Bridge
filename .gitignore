@@ -1,0 +1,23 @@
+# 비밀/키 — 절대 커밋 금지
+keys/
+certs/
+bridge/.env
+bridge/.env.*
+bridge/data/
+caddy/wellknown/public-key.pem
+caddy/wellknown/.well-known/
+
+# SmartThings 런타임 상태 파일 (기기ID, 토큰 등)
+smartthings/_*.json
+
+# Caddy 런타임 데이터 및 임시파일
+caddy_data/
+caddy_config/
+caddy/Caddyfile;*
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

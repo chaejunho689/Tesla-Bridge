@@ -1,0 +1,61 @@
+services:
+  # ── ③ 공개키 HTTPS 서빙 (Tesla 앱 등록 / 가상키 페어링용) ─────────────
+  # 라우터에서 80,443 → 이 PC(192.168.50.175) 포워딩 필요.
+  # Caddy가 Let's Encrypt 인증서를 자동 발급함(HTTP-01/TLS-ALPN).
+  caddy:
+    image: caddy:2
+    container_name: tesla-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/wellknown:/srv:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # ── ② Tesla 공식 명령서명 프록시 (2021+ 차량 필수) ───────────────────
+  # 등록/토큰 발급 완료 후 활성화. keys/private-key.pem 로 명령 서명.
+  tesla-proxy:
+    image: tesla/vehicle-command:latest
+    container_name: tesla-proxy
+    restart: unless-stopped
+    profiles: ["full"]           # 준비되면 `--profile full`로 기동
+    # 이미지 ENTRYPOINT=["tesla-http-proxy"] 이므로 플래그만 전달
+    command:
+      - "-key-file"
+      - "/keys/private-key.pem"
+      - "-cert"
+      - "/certs/cert.pem"
+      - "-tls-key"
+      - "/certs/key.pem"
+      - "-port"
+      - "4443"
+      - "-host"
+      - "0.0.0.0"
+    volumes:
+      - ./keys:/keys:ro
+      - ./certs:/certs:ro
+    expose:
+      - "4443"
+
+  # ── ① 브릿지 API (SmartThings ↔ Tesla) ──────────────────────────────
+  bridge:
+    build: ./bridge
+    container_name: tesla-bridge
+    restart: unless-stopped
+    profiles: ["full"]
+    env_file:
+      - ./bridge/.env
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./bridge/data:/data
+      - ./certs:/certs:ro
+    depends_on:
+      - tesla-proxy
+
+volumes:
+  caddy-data:
+  caddy-config:

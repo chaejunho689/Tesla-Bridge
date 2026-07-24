@@ -1,0 +1,28 @@
+chaejunho689.asuscomm.com {
+	# Tesla가 앱 등록/가상키 페어링 때 이 정확한 경로에서 공개키를 가져감
+	handle /.well-known/appspecific/com.tesla.3p.public-key.pem {
+		root * /srv
+		rewrite * /public-key.pem
+		header Content-Type application/x-pem-file
+		file_server
+	}
+
+	# OAuth 로그인/콜백만 브릿지로 전달 (브라우저 인증 흐름용)
+	handle /login {
+		reverse_proxy bridge:8787
+	}
+	handle /callback* {
+		reverse_proxy bridge:8787
+	}
+
+	# 앱(대시보드/워치/API/에셋)을 브릿지로 공개 노출
+	#  - /api/*, /app.apk, /watch.apk 는 브릿지가 key(BRIDGE_TOKEN)로 보호
+	#  - 페이지 HTML 자체는 key 없이는 무의미(런타임에 URL의 ?key 사용)
+	handle {
+		reverse_proxy bridge:8787
+	}
+
+	log {
+		output stdout
+	}
+}

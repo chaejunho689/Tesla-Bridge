@@ -1,0 +1,70 @@
+name: tesla-vehicle
+components:
+  - id: main
+    label: 차량
+    capabilities:
+      - id: lock
+        version: 1
+      - id: battery
+        version: 1
+      - id: temperatureMeasurement
+        version: 1
+      - id: refresh
+        version: 1
+    categories:
+      - name: Car
+  - id: climate
+    label: 공조
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: AirConditioner
+  - id: charging
+    label: 충전
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: Others
+metadata:
+  deviceType: Car
+  ocfDeviceType: oic.d.vehicle
+  deviceTypeId: Car
+preferences:
+  - name: bridgeAddress
+    title: "브릿지 주소 (IP:포트)"
+    description: "예: 192.168.50.175:8787"
+    required: true
+    preferenceType: string
+    definition:
+      stringType: text
+      minLength: 3
+      maxLength: 64
+      default: "192.168.50.175:8787"
+  - name: bridgeToken
+    title: "브릿지 토큰 (BRIDGE_TOKEN)"
+    required: true
+    preferenceType: string
+    definition:
+      stringType: text
+      minLength: 0
+      maxLength: 128
+      default: "ee8197ea76db66d8ffb603a3663270985be40cd56265ee18"
+  - name: vin
+    title: "차량 VIN (비우면 브릿지 기본값)"
+    required: false
+    preferenceType: string
+    definition:
+      stringType: text
+      minLength: 0
+      maxLength: 20
+      default: ""
+  - name: pollInterval
+    title: "상태 갱신 주기(초, 0=끄기)"
+    required: false
+    preferenceType: integer
+    definition:
+      minimum: 0
+      maximum: 3600
+      default: 0

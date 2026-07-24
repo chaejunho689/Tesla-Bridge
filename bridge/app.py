@@ -1,0 +1,1363 @@
+"""
+Tesla ↔ SmartThings 브릿지.
+
+- OAuth (Authorization Code) 로그인/토큰 저장/자동 갱신
+- 읽기(vehicles, vehicle_data)는 Fleet API로 직접
+- 명령(lock/climate/charge...)은 tesla-http-proxy 경유(서명 필요)
+- SmartThings Edge 드라이버가 호출할 간단한 REST 엔드포인트 제공
+  (BRIDGE_TOKEN 으로 보호 — LAN이라도 아무나 차 제어 못 하게)
+"""
+import asyncio
+import json
+import os
+import time
+import secrets
+from pathlib import Path
+from urllib.parse import urlencode
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, FileResponse, Response
+
+# ── 설정 (환경변수) ──────────────────────────────────────────────
+CLIENT_ID = os.environ["TESLA_CLIENT_ID"]
+CLIENT_SECRET = os.environ["TESLA_CLIENT_SECRET"]
+DOMAIN = os.environ.get("TESLA_DOMAIN", "chaejunho689.asuscomm.com")
+REDIRECT_URI = os.environ.get("TESLA_REDIRECT_URI", f"https://{DOMAIN}/callback")
+FLEET_BASE = os.environ.get("FLEET_BASE", "https://fleet-api.prd.na.vn.cloud.tesla.com")
+AUTH_BASE = os.environ.get("TESLA_AUTH_BASE", "https://auth.tesla.com")
+PROXY_BASE = os.environ.get("PROXY_BASE", "https://tesla-proxy:4443")
+PROXY_CA = os.environ.get("PROXY_CA", "/certs/cert.pem")
+SCOPES = os.environ.get(
+    "TESLA_SCOPES",
+    "openid offline_access vehicle_device_data vehicle_cmds vehicle_charging_cmds vehicle_location",
+)
+BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
+DEFAULT_VIN = os.environ.get("TESLA_VIN", "")
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+TOKENS_FILE = DATA_DIR / "tokens.json"
+
+# 명령 이름 → Fleet API command 엔드포인트 매핑 (허용 목록)
+COMMANDS = {
+    "lock": ("door_lock", None),
+    "unlock": ("door_unlock", None),
+    "climate_on": ("auto_conditioning_start", None),
+    "climate_off": ("auto_conditioning_stop", None),
+    "charge_start": ("charge_start", None),
+    "charge_stop": ("charge_stop", None),
+    "charge_port_open": ("charge_port_door_open", None),
+    "charge_port_close": ("charge_port_door_close", None),
+    "flash": ("flash_lights", None),
+    "honk": ("honk_horn", None),
+    "wake": ("__wake__", None),  # 특수: wake_up 엔드포인트
+}
+
+app = FastAPI(title="tesla-bridge")
+_oauth_states: dict[str, float] = {}
+
+
+# ── 토큰 저장/로드 ───────────────────────────────────────────────
+def load_tokens() -> dict:
+    if TOKENS_FILE.exists():
+        return json.loads(TOKENS_FILE.read_text())
+    return {}
+
+
+def save_tokens(tok: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TOKENS_FILE.write_text(json.dumps(tok, indent=2))
+
+
+async def get_access_token() -> str:
+    tok = load_tokens()
+    if not tok.get("refresh_token"):
+        raise HTTPException(401, "로그인 안 됨. /login 먼저 진행하세요.")
+    # 만료 60초 전이면 갱신
+    if tok.get("expires_at", 0) - time.time() < 60:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                f"{AUTH_BASE}/oauth2/v3/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "refresh_token": tok["refresh_token"],
+                },
+            )
+        if r.status_code != 200:
+            raise HTTPException(401, f"토큰 갱신 실패: {r.text}")
+        new = r.json()
+        tok["access_token"] = new["access_token"]
+        tok["refresh_token"] = new.get("refresh_token", tok["refresh_token"])
+        tok["expires_at"] = time.time() + new.get("expires_in", 28800)
+        save_tokens(tok)
+    return tok["access_token"]
+
+
+def require_bridge_auth(request: Request) -> None:
+    auth = request.headers.get("authorization", "")
+    key = request.query_params.get("key", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else key
+    if not secrets.compare_digest(token, BRIDGE_TOKEN):
+        raise HTTPException(403, "브릿지 인증 실패")
+
+
+# ── 헬스체크 ─────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    tok = load_tokens()
+    return {
+        "ok": True,
+        "logged_in": bool(tok.get("refresh_token")),
+        "token_expires_in": int(tok.get("expires_at", 0) - time.time()) if tok else None,
+    }
+
+
+# ── 모바일 제어 대시보드 ─────────────────────────────────────────
+@app.get("/manifest.webmanifest")
+async def manifest():
+    m = {
+        "name": "테슬라 모델3", "short_name": "홍차",
+        "start_url": f"/?key={BRIDGE_TOKEN}", "scope": "/",
+        "display": "standalone", "orientation": "portrait",
+        "background_color": "#0e0f11", "theme_color": "#0e0f11",
+        "icons": [
+            {"src": "/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+        ],
+    }
+    return JSONResponse(m, media_type="application/manifest+json")
+
+
+@app.get("/icon.png")
+async def icon_png():
+    p = DATA_DIR / "icon.png"
+    if p.exists():
+        return FileResponse(p, media_type="image/png")
+    raise HTTPException(404, "icon.png 없음 — bridge/data/icon.png 에 저장하세요")
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return Response("self.addEventListener('fetch',()=>{});", media_type="application/javascript")
+
+
+@app.get("/app.apk")
+async def app_apk(request: Request):
+    require_bridge_auth(request)  # APK 안에 key가 박혀 있으므로 공개 노출 방지
+    p = DATA_DIR / "tesla.apk"
+    if p.exists():
+        return FileResponse(p, media_type="application/vnd.android.package-archive",
+                            filename="테슬라모델3.apk")
+    raise HTTPException(404, "apk 없음")
+
+
+@app.get("/watch.apk")
+async def watch_apk(request: Request):
+    require_bridge_auth(request)  # 워치 APK도 key 포함
+    p = DATA_DIR / "tesla-watch.apk"
+    if p.exists():
+        return FileResponse(p, media_type="application/vnd.android.package-archive",
+                            filename="테슬라워치.apk")
+    raise HTTPException(404, "watch apk 없음")
+
+
+# ── 갤럭시워치(Wear OS) 대시보드 ─────────────────────────────────
+_WATCH_ASSETS = {
+    "bg.png": "image/png", "s1.png": "image/png", "s2.png": "image/png", "s3.png": "image/png",
+    "arrow.svg": "image/svg+xml", "seat.svg": "image/svg+xml", "wheel.svg": "image/svg+xml",
+}
+
+
+@app.get("/w/{name}")
+async def watch_asset(name: str):
+    mt = _WATCH_ASSETS.get(name)
+    if not mt:
+        raise HTTPException(404, "asset 없음")
+    p = DATA_DIR / "watch" / name
+    if p.exists():
+        return FileResponse(p, media_type=mt)
+    raise HTTPException(404, f"{name} 없음")
+
+
+@app.get("/watch")
+async def watch():
+    return HTMLResponse(WATCH_HTML)
+
+
+@app.get("/")
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+# ── OAuth 로그인 흐름 ────────────────────────────────────────────
+@app.get("/login")
+async def login(key: str = Query("")):
+    if not secrets.compare_digest(key, BRIDGE_TOKEN):
+        return HTMLResponse("<h3>접근 거부: ?key=BRIDGE_TOKEN 필요</h3>", status_code=403)
+    state = secrets.token_urlsafe(16)
+    _oauth_states[state] = time.time()
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": state,
+        "prompt": "login",  # 기존 동의 재사용 방지 → 새 스코프(위치) 강제 재동의
+    }
+    return RedirectResponse(f"{AUTH_BASE}/oauth2/v3/authorize?{urlencode(params)}")
+
+
+@app.get("/callback")
+async def callback(code: str = Query(""), state: str = Query("")):
+    if state not in _oauth_states:
+        return HTMLResponse("<h3>state 불일치/만료. /login 다시 시도.</h3>", status_code=400)
+    _oauth_states.pop(state, None)
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(
+            f"{AUTH_BASE}/oauth2/v3/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "audience": FLEET_BASE,
+            },
+        )
+    if r.status_code != 200:
+        return HTMLResponse(f"<h3>토큰 교환 실패</h3><pre>{r.text}</pre>", status_code=400)
+    t = r.json()
+    save_tokens({
+        "access_token": t["access_token"],
+        "refresh_token": t["refresh_token"],
+        "expires_at": time.time() + t.get("expires_in", 28800),
+    })
+    return HTMLResponse("<h2>✅ Tesla 로그인 완료! 이제 이 창은 닫아도 됩니다.</h2>")
+
+
+# ── 파트너 등록 (일회성, 도메인 등록) ────────────────────────────
+@app.post("/admin/register-partner")
+async def register_partner(request: Request):
+    require_bridge_auth(request)
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(
+            f"{AUTH_BASE}/oauth2/v3/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "scope": SCOPES,
+                "audience": FLEET_BASE,
+            },
+        )
+        if r.status_code != 200:
+            raise HTTPException(400, f"파트너 토큰 실패: {r.text}")
+        partner_token = r.json()["access_token"]
+        r2 = await c.post(
+            f"{FLEET_BASE}/api/1/partner_accounts",
+            headers={"Authorization": f"Bearer {partner_token}"},
+            json={"domain": DOMAIN},
+        )
+    return JSONResponse({"status": r2.status_code, "body": _safe_json(r2)})
+
+
+# ── 차량 목록 / 상태 (읽기: Fleet API 직접) ──────────────────────
+@app.get("/api/vehicles")
+async def vehicles(request: Request):
+    require_bridge_auth(request)
+    at = await get_access_token()
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(
+            f"{FLEET_BASE}/api/1/vehicles",
+            headers={"Authorization": f"Bearer {at}"},
+        )
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.get("/api/state")
+async def state(request: Request, vin: str = Query("")):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    if not vin:
+        raise HTTPException(400, "vin 필요")
+    at = await get_access_token()
+    base = "charge_state;climate_state;drive_state;vehicle_state;gui_settings;vehicle_config"
+    url = f"{FLEET_BASE}/api/1/vehicles/{vin}/vehicle_data"
+    hdr = {"Authorization": f"Bearer {at}"}
+    async with httpx.AsyncClient(timeout=25) as c:
+        # 위치 포함 시도 → 위치 권한 없으면 전체가 실패하므로 위치 빼고 재시도
+        r = await c.get(url, headers=hdr, params={"endpoints": base + ";location_data"})
+        if r.status_code != 200 and "vehicle_location" in r.text:
+            r = await c.get(url, headers=hdr, params={"endpoints": base})
+
+    cache_file = DATA_DIR / "last_state.json"
+    if r.status_code == 200:
+        data = _safe_json(r)
+        if isinstance(data, dict) and data.get("response"):
+            now = time.time()
+            try:
+                cache_file.write_text(json.dumps({"response": data["response"], "cached_at": now}))
+            except Exception:
+                pass
+            return JSONResponse({"response": data["response"], "cached": False, "cached_at": now})
+    # 실패(잠자는 중 등) → 마지막 캐시 반환
+    if cache_file.exists():
+        try:
+            c = json.loads(cache_file.read_text())
+            return JSONResponse({"response": c["response"], "cached": True,
+                                 "cached_at": c.get("cached_at")})
+        except Exception:
+            pass
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+# ── 명령 (프록시 경유, 서명됨) ───────────────────────────────────
+@app.post("/api/command/{action}")
+async def command(action: str, request: Request, vin: str = Query("")):
+    require_bridge_auth(request)
+    if action not in COMMANDS:
+        raise HTTPException(400, f"허용되지 않은 명령: {action}. 가능: {list(COMMANDS)}")
+    vin = vin or DEFAULT_VIN
+    if not vin:
+        raise HTTPException(400, "vin 필요")
+    at = await get_access_token()
+    endpoint, _ = COMMANDS[action]
+
+    # wake_up 은 command가 아니라 별도 엔드포인트 (프록시가 그대로 전달)
+    if endpoint == "__wake__":
+        url = f"{PROXY_BASE}/api/1/vehicles/{vin}/wake_up"
+    else:
+        url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/{endpoint}"
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+# 온도/충전한도처럼 파라미터 있는 명령
+@app.post("/api/set_temp")
+async def set_temp(request: Request, vin: str = Query(""), celsius: float = Query(21.0)):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_temps"
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(
+            url,
+            headers={"Authorization": f"Bearer {at}"},
+            json={"driver_temp": celsius, "passenger_temp": celsius},
+        )
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.post("/api/charge_limit")
+async def charge_limit(request: Request, vin: str = Query(""), percent: int = Query(80)):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_charge_limit"
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(
+            url,
+            headers={"Authorization": f"Bearer {at}"},
+            json={"percent": percent},
+        )
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.post("/api/trunk")
+async def trunk(request: Request, vin: str = Query(""), which: str = Query("rear")):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/actuate_trunk"
+    body = {"which_trunk": "front" if which == "front" else "rear"}
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.post("/api/seat")
+async def seat_heater(request: Request, vin: str = Query(""),
+                      seat: int = Query(0), level: int = Query(3)):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/remote_seat_heater_request"
+    body = {"heater": seat, "level": max(0, min(3, level))}
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.post("/api/steering")
+async def steering_heater(request: Request, vin: str = Query(""), on: bool = Query(True)):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/remote_steering_wheel_heater_request"
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json={"on": on})
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+@app.post("/api/sentry")
+async def sentry(request: Request, vin: str = Query(""), on: bool = Query(True)):
+    require_bridge_auth(request)
+    vin = vin or DEFAULT_VIN
+    at = await get_access_token()
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_sentry_mode"
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json={"on": on})
+    return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+def _safe_json(r: httpx.Response):
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
+
+
+# ── SmartThings 가상 디바이스 양방향 동기화 ─────────────────────
+ST_TOKEN = os.environ.get("SMARTTHINGS_TOKEN", "")
+ST_API = "https://api.smartthings.com"
+ST_DEVICE = os.environ.get("ST_DEVICE", "")       # 단일 "테슬라" 기기
+_NS = "optionoption28278"   # 커스텀 캐퍼빌리티 네임스페이스
+_sync_target = {}   # 컨트롤키 -> 마지막 동기화 값
+_sync_changed = {}  # 컨트롤키 -> 마지막 변경 시각
+_last_push_ts = 0.0  # 표시값 마지막 반영 캐시 시각
+_last_hb = 0.0       # 마지막 하트비트 시각
+
+
+async def _proxy_cmd(vin, at, endpoint, body=None):
+    url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/{endpoint}"
+    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+        return await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body or {})
+
+
+# 컨트롤 정의: key -> (component, capability, attribute)
+_CTRLS = {
+    "climate":  ("main", "switch", "switch"),
+    "lock":     ("main", "doorControl", "door"),          # closed=잠김
+    "trunk":    ("main", _NS + ".trunk", "door"),
+    "frunk":    ("main", _NS + ".frunk", "door"),
+    "sentry":   ("sentry", "switch", "switch"),
+    "settemp":  ("main", _NS + ".targettempc", "temp"),
+    "chglimit": ("main", _NS + ".chargelimitpct", "limit"),
+    "seat_fl":  ("main", _NS + ".seatheatfront", "fl"),
+    "seat_fr":  ("main", _NS + ".seatheatfront", "fr"),
+    "seat_rl":  ("main", _NS + ".seatheatrear", "rl"),
+    "seat_rc":  ("main", _NS + ".seatheatrear", "rc"),
+    "seat_rr":  ("main", _NS + ".seatheatrear", "rr"),
+}
+_SEAT_IDX = {"seat_fl": 0, "seat_fr": 1, "seat_rl": 2, "seat_rc": 4, "seat_rr": 5}
+
+
+async def _apply_control(key, value):
+    """SmartThings에서 바뀐 컨트롤 값을 실제 Tesla 명령으로. 자는 차는 깨우고 재시도."""
+    vin = DEFAULT_VIN
+    at = await get_access_token()
+
+    async def run():
+        if key == "climate":
+            return await _proxy_cmd(vin, at, "auto_conditioning_start" if value == "on" else "auto_conditioning_stop")
+        if key == "lock":
+            return await _proxy_cmd(vin, at, "door_lock" if value == "closed" else "door_unlock")
+        if key == "trunk":
+            return await _proxy_cmd(vin, at, "actuate_trunk", {"which_trunk": "rear"})
+        if key == "frunk":
+            return await _proxy_cmd(vin, at, "actuate_trunk", {"which_trunk": "front"})
+        if key == "sentry":
+            return await _proxy_cmd(vin, at, "set_sentry_mode", {"on": value == "on"})
+        if key == "settemp":
+            t = float(value)
+            return await _proxy_cmd(vin, at, "set_temps", {"driver_temp": t, "passenger_temp": t})
+        if key == "chglimit":
+            return await _proxy_cmd(vin, at, "set_charge_limit", {"percent": int(float(value))})
+        if key in _SEAT_IDX:
+            return await _proxy_cmd(vin, at, "remote_seat_heater_request",
+                                    {"heater": _SEAT_IDX[key], "level": 3 if value == "on" else 0})
+        return None
+
+    r = await run()
+    txt = ((r.text if r is not None else "") or "").lower()
+    if r is None or r.status_code != 200 or "asleep" in txt or "offline" in txt or "unavailable" in txt:
+        try:
+            async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+                await c.post(f"{PROXY_BASE}/api/1/vehicles/{vin}/wake_up",
+                             headers={"Authorization": f"Bearer {at}"})
+        except Exception:
+            pass
+        await asyncio.sleep(12)
+        r = await run()
+    return r
+
+
+def _desired_all(resp):
+    """차량 실제 상태 -> 각 컨트롤이 가져야 할 값"""
+    cs = resp.get("charge_state") or {}
+    cl = resp.get("climate_state") or {}
+    vs = resp.get("vehicle_state") or {}
+    seat = lambda v: "on" if (v or 0) > 0 else "off"
+    out = {
+        "climate": "on" if cl.get("is_climate_on") else "off",
+        "lock": "closed" if vs.get("locked") else "open",
+        "trunk": "open" if (vs.get("rt") or 0) != 0 else "closed",
+        "frunk": "open" if (vs.get("ft") or 0) != 0 else "closed",
+        "sentry": "on" if vs.get("sentry_mode") else "off",
+        "seat_fl": seat(cl.get("seat_heater_left")),
+        "seat_fr": seat(cl.get("seat_heater_right")),
+        "seat_rl": seat(cl.get("seat_heater_rear_left")),
+        "seat_rc": seat(cl.get("seat_heater_rear_center")),
+        "seat_rr": seat(cl.get("seat_heater_rear_right")),
+    }
+    if cl.get("driver_temp_setting") is not None:
+        out["settemp"] = max(15, min(28, round(cl["driver_temp_setting"])))
+    if cs.get("charge_limit_soc") is not None:
+        out["chglimit"] = max(50, min(100, int(cs["charge_limit_soc"])))
+    return out
+
+
+def _read_cache():
+    f = DATA_DIR / "last_state.json"
+    if f.exists():
+        try:
+            c = json.loads(f.read_text())
+            return c.get("response"), c.get("cached_at", 0)
+        except Exception:
+            pass
+    return None, 0
+
+
+async def _st_get_status(device_id):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{ST_API}/devices/{device_id}/status",
+                            headers={"Authorization": f"Bearer {ST_TOKEN}"})
+        return r.json()
+    except Exception:
+        return None
+
+
+async def _st_event(device_id, component, capability, attribute, value, unit=None):
+    ev = {"component": component, "capability": capability, "attribute": attribute, "value": value}
+    if unit is not None:
+        ev["unit"] = unit
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(f"{ST_API}/virtualdevices/{device_id}/events",
+                         headers={"Authorization": f"Bearer {ST_TOKEN}"},
+                         json={"deviceEvents": [ev]})
+    except Exception:
+        pass
+
+
+async def _fetch_and_cache(vin):
+    at = await get_access_token()
+    base = "charge_state;climate_state;drive_state;vehicle_state;gui_settings;vehicle_config"
+    url = f"{FLEET_BASE}/api/1/vehicles/{vin}/vehicle_data"
+    hdr = {"Authorization": f"Bearer {at}"}
+    async with httpx.AsyncClient(timeout=25) as c:
+        r = await c.get(url, headers=hdr, params={"endpoints": base + ";location_data"})
+        if r.status_code != 200 and "vehicle_location" in r.text:
+            r = await c.get(url, headers=hdr, params={"endpoints": base})
+    if r.status_code == 200:
+        data = _safe_json(r)
+        if isinstance(data, dict) and data.get("response"):
+            (DATA_DIR / "last_state.json").write_text(
+                json.dumps({"response": data["response"], "cached_at": time.time()}))
+
+
+async def _delayed_fetch():
+    await asyncio.sleep(10)
+    try:
+        await _fetch_and_cache(DEFAULT_VIN)
+    except Exception:
+        pass
+
+
+async def _st_events(evs):
+    """이벤트 목록을 8개씩 나눠 전송 (API 제한)"""
+    for i in range(0, len(evs), 8):
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                await c.post(f"{ST_API}/virtualdevices/{ST_DEVICE}/events",
+                             headers={"Authorization": f"Bearer {ST_TOKEN}"},
+                             json={"deviceEvents": evs[i:i + 8]})
+        except Exception:
+            pass
+
+
+_geo_cache = {"lat": None, "lon": None, "addr": None}
+
+
+async def _geocode(lat, lon):
+    if _geo_cache["addr"] and _geo_cache["lat"] is not None and \
+       abs(lat - _geo_cache["lat"]) < 0.0005 and abs(lon - _geo_cache["lon"]) < 0.0005:
+        return _geo_cache["addr"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://nominatim.openstreetmap.org/reverse",
+                            params={"format": "json", "lat": lat, "lon": lon,
+                                    "accept-language": "ko", "zoom": 18},
+                            headers={"User-Agent": "tesla-bridge/1.0"})
+        addr = r.json().get("display_name")
+        if addr:
+            _geo_cache.update({"lat": lat, "lon": lon, "addr": addr})
+        return addr
+    except Exception:
+        return _geo_cache["addr"]
+
+
+def _kst_str():
+    return time.strftime("%m/%d %H:%M", time.gmtime(time.time() + 32400))
+
+
+def _display_events(resp):
+    cs = resp.get("charge_state") or {}
+    cl = resp.get("climate_state") or {}
+    vs = resp.get("vehicle_state") or {}
+    MI, PSI = 1.609344, 14.5037738
+    cap = lambda n: _NS + "." + n
+    evs = []
+
+    def E(c, cp, a, v, u=None):
+        e = {"component": c, "capability": cp, "attribute": a, "value": v}
+        if u:
+            e["unit"] = u
+        evs.append(e)
+
+    if cs.get("battery_level") is not None:
+        E("main", cap("batteryteslr"), "battery", int(cs["battery_level"]), "%")
+    st = cs.get("charging_state")
+    E("main", cap("teslrchargestatus"), "chargestatus",
+      "충전 중" if st == "Charging" else ("충전 완료" if st == "Complete" else "충전 안함"))
+    if cl.get("inside_temp") is not None:
+        E("main", cap("tempsinfo"), "inside", round(cl["inside_temp"], 1), "C")
+    if cl.get("outside_temp") is not None:
+        E("main", cap("tempsinfo"), "outside", round(cl["outside_temp"], 1), "C")
+    if cl.get("driver_temp_setting") is not None:
+        E("main", cap("tempsinfo"), "target", round(cl["driver_temp_setting"]), "C")
+    if vs.get("odometer") is not None:
+        E("main", cap("odometer"), "odometerReading", round(vs["odometer"] * MI), "km")
+    if cs.get("battery_range") is not None:
+        E("main", cap("odometer"), "odometerRemain", round(cs["battery_range"] * MI), "km")
+    E("main", cap("chargespeed"), "power", cs.get("charger_power") or 0, "kW")
+    if cs.get("charge_energy_added") is not None:
+        E("main", cap("odoenergy"), "odometerEnergy", round(cs["charge_energy_added"], 1), "kWh")
+    m = cs.get("minutes_to_full_charge") or (cs.get("time_to_full_charge") or 0) * 60
+    if st == "Charging" and m:
+        E("main", cap("chargetimeleft"), "timeleft", f"{int(m // 60)}시간 {int(m % 60)}분")
+    else:
+        E("main", cap("chargetimeleft"), "timeleft", "완충" if st == "Complete" else "-")
+    for a, f in (("FL", "tpms_pressure_fl"), ("FR", "tpms_pressure_fr")):
+        if vs.get(f) is not None:
+            E("main", cap("fronttirepsi"), a, round(vs[f] * PSI), "psi")
+    for a, f in (("RL", "tpms_pressure_rl"), ("RR", "tpms_pressure_rr")):
+        if vs.get(f) is not None:
+            E("main", cap("reartirepsi"), a, round(vs[f] * PSI), "psi")
+    return evs
+
+
+async def _sync_once():
+    global _last_push_ts, _last_hb
+    if not ST_DEVICE:
+        return
+    status = await _st_get_status(ST_DEVICE)
+    if status is None:
+        return
+    comps = status.get("components", {})
+
+    def read(key):
+        c, cp, a = _CTRLS[key]
+        try:
+            return comps[c][cp][a]["value"]
+        except Exception:
+            return None
+
+    resp, cache_ts = _read_cache()
+    des = _desired_all(resp) if resp else {}
+    now = time.time()
+
+    for key in _CTRLS:
+        actual = read(key)
+        if actual is None:
+            # SmartThings에 값이 아직 없음 → 차량 상태로 초기화 (시트 null→off 등)
+            if key in des:
+                c, cp, a = _CTRLS[key]
+                unit = "C" if key == "settemp" else ("%" if key == "chglimit" else None)
+                await _st_event(ST_DEVICE, c, cp, a, des[key], unit)
+                _sync_target[key] = des[key]
+            continue
+        tgt = _sync_target.get(key)
+        if tgt is None:
+            _sync_target[key] = actual
+            continue
+        if str(actual) != str(tgt):
+            # 사용자가 SmartThings에서 조작 → Tesla 명령
+            _sync_target[key] = actual
+            _sync_changed[key] = now
+            try:
+                await _apply_control(key, actual)
+            except Exception:
+                pass
+            asyncio.create_task(_delayed_fetch())
+        elif key in des and cache_ts > _sync_changed.get(key, 0):
+            # 차량 실제 상태 → SmartThings 반영
+            want = des[key]
+            if str(want) != str(actual):
+                c, cp, a = _CTRLS[key]
+                unit = "C" if key == "settemp" else ("%" if key == "chglimit" else None)
+                await _st_event(ST_DEVICE, c, cp, a, want, unit)
+                _sync_target[key] = want
+                _sync_changed[key] = now
+
+    # 표시값 반영 (새 캐시일 때만)
+    if resp is not None and cache_ts > _last_push_ts:
+        await _st_events(_display_events(resp))
+        ds = resp.get("drive_state") or {}
+        if ds.get("latitude") is not None:
+            addr = await _geocode(ds["latitude"], ds["longitude"])
+            await _st_events([
+                {"component": "main", "capability": _NS + ".teslrlocation", "attribute": "latitude", "value": ds["latitude"]},
+                {"component": "main", "capability": _NS + ".teslrlocation", "attribute": "longitude", "value": ds["longitude"]},
+                {"component": "main", "capability": _NS + ".teslrlocation", "attribute": "address",
+                 "value": addr or f'{ds["latitude"]:.5f}, {ds["longitude"]:.5f}'},
+            ])
+        _last_push_ts = cache_ts
+        _last_hb = now
+
+    # 하트비트 (기기 오프라인 방지, ~12초마다)
+    if now - _last_hb > 12:
+        await _st_event(ST_DEVICE, "main", _NS + ".teslrlocation", "lastUpdateTime", _kst_str())
+        _last_hb = now
+
+
+_last_fetch = 0.0
+
+
+async def _sync_loop():
+    global _last_fetch
+    await asyncio.sleep(5)
+    while True:
+        try:
+            # 5분마다 차량 데이터 자동 갱신 (자면 실패 → 캐시 유지)
+            if time.time() - _last_fetch > 300:
+                _last_fetch = time.time()
+                try:
+                    await _fetch_and_cache(DEFAULT_VIN)
+                except Exception:
+                    pass
+            await _sync_once()
+        except Exception:
+            pass
+        await asyncio.sleep(6)
+
+
+@app.on_event("startup")
+async def _start_sync():
+    if ST_TOKEN and ST_DEVICE:
+        asyncio.create_task(_sync_loop())
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0e0f11">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="테슬라 모델3">
+<meta name="application-name" content="테슬라 모델3">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" type="image/png" href="/icon.png">
+<title>테슬라 모델3</title>
+<style>
+  :root { --bg:#0e0f11; --card:#1a1c1f; --card2:#232629; --txt:#f2f3f5; --sub:#9aa0a6; --red:#e82127; --grn:#2ecc71; --blu:#3b9dff; --amber:#f5a623; --line:#2c2f33; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:16px; padding-bottom:44px; max-width:520px; margin:0 auto; }
+  h1 { font-size:22px; margin:4px 0 2px; display:flex; align-items:center; gap:8px; }
+  .sub { color:var(--sub); font-size:13px; margin-bottom:16px; }
+  .card { background:var(--card); border-radius:16px; padding:16px; margin-bottom:14px; }
+  .cardh { font-size:13px; color:var(--sub); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; }
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .stat { background:var(--card2); border-radius:12px; padding:12px; }
+  .stat .k { color:var(--sub); font-size:12px; }
+  .stat .v { font-size:20px; font-weight:600; margin-top:3px; }
+  .stat .v small { font-size:12px; color:var(--sub); font-weight:400; }
+  .bigsoc { font-size:44px; font-weight:700; line-height:1; }
+  .bigsoc small { font-size:18px; color:var(--sub); font-weight:500; }
+  .bar { height:10px; background:var(--card2); border-radius:6px; overflow:hidden; margin:14px 0 6px; position:relative; }
+  .bar > i { display:block; height:100%; background:linear-gradient(90deg,#2ecc71,#27ae60); width:0%; transition:width .5s; }
+  .bar > .lim { position:absolute; top:-3px; width:2px; height:16px; background:var(--amber); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+  button { border:0; border-radius:12px; padding:15px 10px; font-size:15px; font-weight:600; color:#fff; background:var(--card2); cursor:pointer; transition:transform .05s, opacity .2s; }
+  button:active { transform:scale(.96); }
+  button.red { background:var(--red); }
+  button.wide { width:100%; }
+  button.active { box-shadow:inset 0 0 0 2px var(--grn); color:var(--grn); }
+  /* 기능별 활성 색상 */
+  #btnLock.active   { box-shadow:inset 0 0 0 2px #f5c518; color:#f5c518; }  /* 잠금해제 = 노랑 */
+  #btnClim.active   { box-shadow:inset 0 0 0 2px #38bdf8; color:#38bdf8; }  /* 공조 = 밝은 파랑 */
+  #btnChg.active    { box-shadow:inset 0 0 0 2px var(--grn); color:var(--grn); } /* 충전구 열림 = 초록 */
+  #btnSentry.active { box-shadow:inset 0 0 0 2px #ff4d4d; color:#ff4d4d; }  /* 감시 = 밝은 빨강 */
+  #btnFrunk.active, #btnTrunk.active { box-shadow:inset 0 0 0 2px #fff; color:#fff; } /* 열림 = 흰색 */
+  /* 롱프레스 홀드 채움 효과 (왼→오른쪽) */
+  @property --fill { syntax:'<percentage>'; initial-value:0%; inherits:false; }
+  #btnFrunk, #btnTrunk { --fill:0%;
+    background-image:linear-gradient(to right, rgba(56,189,248,.6) var(--fill), transparent var(--fill));
+    transition:--fill .15s linear, transform .05s;
+    -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
+  #conn { cursor:pointer; position:relative; display:inline-block; }
+  @property --ang { syntax:'<angle>'; initial-value:0deg; inherits:false; }
+  #conn.sleeping::before { content:""; position:absolute; inset:-3px; border-radius:20px; padding:3px;
+    background:conic-gradient(from var(--ang), #ff0059,#ff8a00,#ffe600,#2ecc71,#3b9dff,#a34bff,#ff0059);
+    -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor;
+    mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite:exclude;
+    animation:angspin 3s linear infinite; pointer-events:none; }
+  @keyframes angspin { to { --ang:360deg; } }
+  .slider { margin:4px 0 2px; }
+  .slider label { display:flex; justify-content:space-between; color:var(--sub); font-size:13px; margin-bottom:8px; }
+  .slider label b { color:var(--txt); font-size:16px; }
+  input[type=range] { width:100%; accent-color:var(--red); height:28px; }
+  #tempslider { accent-color:var(--blu); }
+  #limslider  { accent-color:var(--grn); }
+  .updlink { display:block; text-align:right; color:var(--sub); font-size:11px; margin:20px 4px 8px; text-decoration:none; opacity:.7; }
+  .vintext { text-align:left; color:var(--sub); font-size:10px; opacity:.5; letter-spacing:.3px; margin:20px 4px 0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  /* 모던 확인 모달 */
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
+  #modal.on { display:flex; animation:fade .15s ease; }
+  @keyframes fade { from{opacity:0} to{opacity:1} }
+  .modalbox { background:var(--card); border:1px solid var(--line); border-radius:20px; padding:24px 20px 16px; width:80%; max-width:340px; box-shadow:0 16px 48px rgba(0,0,0,.55); animation:pop .18s cubic-bezier(.2,.9,.3,1.2); }
+  @keyframes pop { from{transform:scale(.9);opacity:.5} to{transform:scale(1);opacity:1} }
+  .modalmsg { font-size:17px; color:var(--txt); text-align:center; margin-bottom:22px; line-height:1.5; }
+  .modalbtns { display:flex; gap:10px; }
+  .modalbtns button { flex:1; padding:14px; border-radius:14px; font-size:15px; font-weight:700; border:0; }
+  .mcancel { background:var(--card2); color:var(--txt); }
+  .mok { background:var(--blu); color:#fff; }
+  .sec { color:var(--sub); font-size:12px; text-transform:uppercase; letter-spacing:.5px; margin:18px 4px 8px; }
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(90px); background:#000; color:#fff; padding:12px 18px; border-radius:12px; font-size:14px; opacity:0; transition:.3s; max-width:90%; text-align:center; z-index:9; box-shadow:0 6px 24px rgba(0,0,0,.5); }
+  #toast.show { transform:translateX(-50%) translateY(0); opacity:1; }
+  .pill { font-size:12px; padding:3px 9px; border-radius:20px; background:var(--card2); color:var(--sub); }
+  .pill.on { background:rgba(46,204,113,.15); color:var(--grn); }
+  .muted { color:var(--sub); font-size:12px; text-align:center; margin-top:8px; }
+  /* 온도 3박스 */
+  .temps { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+  .tb { background:var(--card2); border-radius:12px; padding:12px 6px; text-align:center; }
+  .tb .k { color:var(--sub); font-size:12px; }
+  .tb .v { font-size:22px; font-weight:600; margin-top:4px; }
+  /* SVG 다이어그램 (타이어/시트 실루엣) */
+  .diagram { display:block; width:100%; max-width:220px; margin:2px auto; }
+  .psi { fill:var(--txt); font:700 17px sans-serif; }
+  .psi.warn { fill:var(--amber); }
+  .lab { fill:var(--sub); font:400 10px sans-serif; }
+  .seat { cursor:pointer; }
+  .seat rect { transition:fill .2s; }
+  /* 지도 */
+  #map { width:100%; height:170px; border:0; border-radius:12px; background:var(--card2); }
+  a.btn { display:block; text-align:center; text-decoration:none; }
+  /* 기능 아이콘 */
+  .ic { width:1.15em; height:1.15em; fill:currentColor; vertical-align:-.2em; margin-right:6px; }
+  .cih { width:1.05em; height:1.05em; fill:currentColor; vertical-align:-.16em; margin-right:5px; }
+  .logo { width:1.3em; height:1.3em; fill:var(--red,#e82127); vertical-align:-.22em; margin-right:5px; }
+</style>
+</head>
+<body>
+  <h1><svg class="logo" viewBox="0 0 24 24"><path d="m12 5.362l2.475-3.026s4.245.09 8.471 2.054c-1.082 1.636-3.231 2.438-3.231 2.438c-.146-1.439-1.154-1.79-4.354-1.79L12 24L8.619 5.034c-3.18 0-4.188.354-4.335 1.792c0 0-2.146-.795-3.229-2.43C5.28 2.431 9.525 2.34 9.525 2.34L12 5.362l-.004.002H12v-.002zm0-3.899c3.415-.03 7.326.528 11.328 2.28c.535-.968.672-1.395.672-1.395C19.625.612 15.528.015 12 0C8.472.015 4.375.61 0 2.349c0 0 .195.525.672 1.396C4.674 1.989 8.585 1.435 12 1.46v.003z"/></svg>홍차 <span id="conn" class="pill" onclick="wake()">…</span></h1>
+  <div class="sub">Tesla Model 3 AWD · <a href="#" onclick="refresh();return false" style="color:var(--blu)">새로고침</a></div>
+
+  <!-- 배터리/주행 -->
+  <div class="card" id="hero">
+    <div style="display:flex; justify-content:space-between; align-items:flex-end">
+      <div class="bigsoc"><span id="soc">–</span><small>%</small></div>
+      <div style="text-align:right">
+        <div class="v" style="font-size:22px; font-weight:600"><span id="range">–</span> <small style="color:var(--sub);font-size:13px">km 주행가능</small></div>
+        <div style="color:var(--sub); font-size:13px; margin-top:2px" id="chgstate">–</div>
+      </div>
+    </div>
+    <div class="bar"><i id="socbar"></i><span class="lim" id="limmark"></span></div>
+    <div style="display:flex; justify-content:space-between; color:var(--sub); font-size:12px">
+      <span>목표 <span id="limtxt">–</span>%</span>
+      <span id="updated">불러오는 중…</span>
+    </div>
+  </div>
+
+  <!-- 온도 3박스 -->
+  <div class="card">
+    <div class="temps">
+      <div class="tb"><div class="k">내기</div><div class="v"><span id="itemp">–</span>°</div></div>
+      <div class="tb"><div class="k">외기</div><div class="v"><span id="otemp">–</span>°</div></div>
+      <div class="tb"><div class="k">설정 목표</div><div class="v"><span id="ttemp">–</span>°</div></div>
+    </div>
+  </div>
+
+  <!-- 주행거리 / 상태 -->
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="k">총 주행거리</div><div class="v"><span id="odo">–</span> <small>km</small></div></div>
+      <div class="stat"><div class="k">상태</div><div class="v" style="font-size:16px"><span id="state">–</span></div></div>
+    </div>
+  </div>
+
+  <!-- 충전 상세 -->
+  <div class="card" id="chgcard">
+    <div class="cardh"><svg class="cih" viewBox="0 0 24 24"><path d="m17.635 9.991l-4.938-.1l-.064-7.01c.067-.958-.633-1.4-1.366.059l-5.629 9.53c-.648 1.046-.557 1.41.625 1.524h5l.131 6.573c-.017 1.41.574 2.16 1.438.432l5.686-9.735c.482-.728.282-1.251-.883-1.273"/></svg>충전 <span id="chgbadge" class="pill">–</span></div>
+    <div class="stats">
+      <div class="stat"><div class="k">충전 속도</div><div class="v"><span id="ckw">–</span> <small>kW</small></div></div>
+      <div class="stat"><div class="k">목표 충전량</div><div class="v"><span id="ctarget">–</span> <small>%</small></div></div>
+      <div class="stat"><div class="k" id="addedk">추가된 양</div><div class="v"><span id="cadded">–</span> <small>kWh</small></div></div>
+      <div class="stat"><div class="k">완충까지</div><div class="v" style="font-size:16px"><span id="cfull">–</span></div></div>
+    </div>
+  </div>
+
+  <!-- 타이어 (차체 하부 실루엣) -->
+  <div class="card">
+    <div class="cardh">🛞 타이어 공기압 <span class="pill">PSI</span></div>
+    <svg class="diagram" viewBox="0 0 220 290">
+      <rect x="50" y="24" width="120" height="242" rx="44" fill="#33373c"/>
+      <rect id="wtfl" x="28" y="52" width="26" height="54" rx="12" fill="#4a4f55"/>
+      <rect id="wtfr" x="166" y="52" width="26" height="54" rx="12" fill="#4a4f55"/>
+      <rect id="wtrl" x="28" y="184" width="26" height="54" rx="12" fill="#4a4f55"/>
+      <rect id="wtrr" x="166" y="184" width="26" height="54" rx="12" fill="#4a4f55"/>
+      <text id="tfl" class="psi" x="88" y="72" text-anchor="middle">–</text><text class="lab" x="88" y="88" text-anchor="middle">앞좌</text>
+      <text id="tfr" class="psi" x="132" y="72" text-anchor="middle">–</text><text class="lab" x="132" y="88" text-anchor="middle">앞우</text>
+      <text id="trl" class="psi" x="88" y="220" text-anchor="middle">–</text><text class="lab" x="88" y="236" text-anchor="middle">뒤좌</text>
+      <text id="trr" class="psi" x="132" y="220" text-anchor="middle">–</text><text class="lab" x="132" y="236" text-anchor="middle">뒤우</text>
+    </svg>
+  </div>
+
+  <!-- 열선 시트 (실내 top-down 실루엣) -->
+  <div class="card">
+    <div class="cardh">🔥 열선 시트 <span class="pill">탭 = ON/OFF</span></div>
+    <svg class="diagram" viewBox="0 0 220 290">
+      <defs><linearGradient id="heat" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#ff8a4c"/><stop offset="1" stop-color="#e82127"/></linearGradient></defs>
+      <rect x="30" y="16" width="160" height="258" rx="54" fill="#1a1c1f" stroke="#2c2f33" stroke-width="2"/>
+      <path d="M46 58 Q110 32 174 58" fill="none" stroke="#2c2f33" stroke-width="2"/>
+      <circle cx="70" cy="50" r="11" fill="none" stroke="#3a3f45" stroke-width="3"/>
+      <g class="seat" onclick="toggleSeat(0)"><rect id="sFL" x="48" y="72" width="46" height="58" rx="14" fill="#3a3f45"/></g>
+      <text class="lab" x="71" y="146" text-anchor="middle">운전석</text>
+      <g class="seat" onclick="toggleSeat(1)"><rect id="sFR" x="128" y="72" width="46" height="58" rx="14" fill="#3a3f45"/></g>
+      <text class="lab" x="151" y="146" text-anchor="middle">조수석</text>
+      <g class="seat" onclick="toggleSeat(2)"><rect id="sRL" x="44" y="186" width="40" height="56" rx="12" fill="#3a3f45"/></g>
+      <text class="lab" x="64" y="256" text-anchor="middle">뒤좌</text>
+      <g class="seat" onclick="toggleSeat(4)"><rect id="sRC" x="91" y="190" width="40" height="52" rx="12" fill="#3a3f45"/></g>
+      <text class="lab" x="111" y="256" text-anchor="middle">뒤중</text>
+      <g class="seat" onclick="toggleSeat(5)"><rect id="sRR" x="138" y="186" width="40" height="56" rx="12" fill="#3a3f45"/></g>
+      <text class="lab" x="158" y="256" text-anchor="middle">뒤우</text>
+    </svg>
+  </div>
+
+  <!-- 위치 -->
+  <div class="card">
+    <div class="cardh">📍 위치 <span id="locbadge" class="pill">–</span></div>
+    <iframe id="map" src="about:blank" loading="lazy"></iframe>
+    <div class="muted" id="loctxt" style="margin:8px 0 10px">위치 불러오는 중…</div>
+    <a class="btn" id="maplink" href="#" target="_blank"><button class="wide">🗺️ 지도 앱에서 열기</button></a>
+  </div>
+
+  <!-- 제어 -->
+  <div class="sec">제어 (탭 = ON/OFF, 현재 상태 표시)</div>
+  <div class="row">
+    <button id="btnLock" onclick="tgl('lock')">잠금</button>
+    <button id="btnClim" onclick="tgl('clim')">공조</button>
+  </div>
+  <div class="row">
+    <button id="btnChg" onclick="tgl('chg')">충전</button>
+    <button id="btnSentry" onclick="tgl('sentry')">감시</button>
+  </div>
+  <div class="row">
+    <button id="btnFrunk">프렁크</button>
+    <button id="btnTrunk">트렁크</button>
+  </div>
+
+  <div class="card">
+    <div class="slider">
+      <label>목표 온도 <b><span id="tempval">21</span>°C</b></label>
+      <input type="range" min="15" max="28" value="21" id="tempslider" oninput="tempval.textContent=this.value">
+      <button class="wide" style="margin-top:10px" onclick="setTemp()">온도 설정</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="slider">
+      <label>충전 한도 <b><span id="limval">80</span>%</b></label>
+      <input type="range" min="50" max="100" value="80" id="limslider" oninput="limval.textContent=this.value">
+      <button class="wide" style="margin-top:10px" onclick="setLimit()">한도 설정</button>
+    </div>
+  </div>
+
+  <div class="sec">기타</div>
+  <div class="row">
+    <button onclick="cmd('flash','라이트 깜빡')"><svg class="ic" viewBox="0 0 24 24"><path d="M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377"/></svg>라이트</button>
+    <button onclick="cmd('honk','경적')"><svg class="ic" viewBox="0 0 24 24"><path d="M21.184 10.073c-.45 0-.815.255-.815.569v.373h-.957c.019 0-.023-.01-.075 0h-8.31c-1.2 0-4.2-3.746-5.5-5.443a2.04 2.04 0 0 0-1.662-.8A1.9 1.9 0 0 0 2 6.677v10.856a1.693 1.693 0 0 0 1.693 1.693a2.26 2.26 0 0 0 1.875-.986c1.122-1.644 3.4-4.793 4.608-5.058a3.6 3.6 0 0 0-.2 1.289a3.153 3.153 0 0 0 2.8 3.42l4.3.046c.661.007 1.208-.576 1.7-1.059a3.12 3.12 0 0 0 .679-2.361a6.8 6.8 0 0 0-.4-1.76h1.313v.45c.026.315.412.556.862.538s.8-.287.771-.6v-2.5c-.001-.317-.367-.572-.817-.572m-5.171 6.068H13.18c-.449-.058-1.025.184-1.428-1.555a1.3 1.3 0 0 1 .012-.84c.061-.237.236-.875.714-.875H16.7c.69.046 1.151.909 1.151 1.738c.004 1.55-.998 1.522-1.838 1.532"/></svg>경적</button>
+  </div>
+
+  <div id="vin" class="vintext"></div>
+  <a class="updlink" id="updlink" href="#">애플리케이션 업데이트</a>
+
+  <div id="modal">
+    <div class="modalbox">
+      <div class="modalmsg" id="modalmsg"></div>
+      <div class="modalbtns">
+        <button class="mcancel" id="mcancel">취소</button>
+        <button class="mok" id="mok">확인</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+<script>
+if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(function(){});
+const KEY = new URLSearchParams(location.search).get('key') || '';
+(function(){ var u=document.getElementById('updlink'); if(u) u.href='/app.apk?key='+encodeURIComponent(KEY); })();
+document.addEventListener('contextmenu', function(e){ e.preventDefault(); });   // 대시보드 전체 우클릭/롱프레스 메뉴 차단
+const MI=1.609344, PSI=14.5037738;
+const $=id=>document.getElementById(id);
+function q(p){ return p + (p.includes('?')?'&':'?') + 'key=' + encodeURIComponent(KEY); }
+let toastT;
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),2300); }
+
+async function cmd(action,label){
+  toast(label+' 전송…');
+  try{
+    const r=await fetch(q('/api/command/'+action),{method:'POST'});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok && j.response && j.response.result===false){ toast('❌ '+label+': '+(j.response.reason||'실패')); }
+    else if(r.ok){ toast('✅ '+label+' 완료'); setTimeout(refresh,1800); }
+    else { toast('❌ '+label+' 실패 ('+r.status+')'); }
+  }catch(e){ toast('❌ 연결 실패'); }
+}
+async function setTemp(){ const c=$('tempslider').value; toast('온도 '+c+'° 설정…');
+  try{ const r=await fetch(q('/api/set_temp?celsius='+c),{method:'POST'}); toast(r.ok?'✅ 온도 '+c+'°':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
+async function setLimit(){ const p=$('limslider').value; toast('충전한도 '+p+'% 설정…');
+  try{ const r=await fetch(q('/api/charge_limit?percent='+p),{method:'POST'}); toast(r.ok?'✅ 한도 '+p+'%':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
+
+function tire(id,wid,bar){ const el=$(id),w=$(wid); if(bar==null){el.textContent='–';return;} const p=Math.round(bar*PSI); el.textContent=p; const warn=p<33||p>44; el.classList.toggle('warn',warn); if(w) w.setAttribute('fill', warn?'#6b4a1f':'#4a4f55'); }
+
+const SEATMAP={0:{el:'sFL',f:'seat_heater_left',n:'운전석'},1:{el:'sFR',f:'seat_heater_right',n:'조수석'},2:{el:'sRL',f:'seat_heater_rear_left',n:'뒤좌'},4:{el:'sRC',f:'seat_heater_rear_center',n:'뒤중'},5:{el:'sRR',f:'seat_heater_rear_right',n:'뒤우'}};
+let seatState={};
+function paintSeat(i,on){ const el=$(SEATMAP[i].el); if(el) el.setAttribute('fill', on?'url(#heat)':'#3a3f45'); }
+function updateSeats(cl){ for(const i in SEATMAP){ const v=cl[SEATMAP[i].f]; if(v!=null){ seatState[i]=v; paintSeat(i, v>0); } } }
+async function toggleSeat(i){
+  const on=(seatState[i]||0)>0, lvl=on?0:3;
+  paintSeat(i,!on); seatState[i]=lvl; toast('🔥 '+SEATMAP[i].n+(lvl>0?' 켜는 중…':' 끄는 중…'));
+  try{ const r=await fetch(q('/api/seat?seat='+i+'&level='+lvl),{method:'POST'}); const j=await r.json().catch(()=>({}));
+    if(j.response && j.response.result===false){ toast('❌ '+SEATMAP[i].n+': '+(j.response.reason||'실패')); paintSeat(i,on); seatState[i]=on?3:0; }
+    else toast('🔥 '+SEATMAP[i].n+(lvl>0?' ON':' OFF'));
+  }catch(e){ toast('❌ 연결 실패'); paintSeat(i,on); seatState[i]=on?3:0; }
+}
+async function act(path,label){ toast(label+' 전송…');
+  try{ const r=await fetch(q(path),{method:'POST'}); const j=await r.json().catch(()=>({}));
+    if(r.ok && j.response && j.response.result===false){ toast('❌ '+label+': '+(j.response.reason||'실패')); }
+    else if(r.ok){ toast('✅ '+label+' 완료'); } else { toast('❌ '+label+' 실패 ('+r.status+')'); }
+  }catch(e){ toast('❌ 연결 실패'); } }
+const IC={
+  lock:'M17.744 8.667v-.953a5.744 5.744 0 0 0-11.488 0v.953a1.915 1.915 0 0 0-1.915 1.9V20.1A1.915 1.915 0 0 0 6.256 22h11.488a1.915 1.915 0 0 0 1.915-1.9v-9.529a1.915 1.915 0 0 0-1.915-1.904m-1.914 0H8.17v-.953A3.74 3.74 0 0 1 12 3.905a3.74 3.74 0 0 1 3.83 3.809Z',
+  open:'m17.635 9.991l-4.938-.1l-.064-7.01c.067-.958-.633-1.4-1.366.059l-5.629 9.53c-.648 1.046-.557 1.41.625 1.524h5l.131 6.573c-.017 1.41.574 2.16 1.438.432l5.686-9.735c.482-.728.282-1.251-.883-1.273',
+  fan:'M13.658 12.2a1.01 1.01 0 0 0-1.252.978V21a1.01 1.01 0 0 0 1.252.978a5.01 5.01 0 0 0 4.067-4.891a5.16 5.16 0 0 0-4.067-4.887m-3.424-.4a1.008 1.008 0 0 0 1.251-.978V3a1.01 1.01 0 0 0-1.251-.978a5.16 5.16 0 0 0-4.067 4.89a5.01 5.01 0 0 0 4.067 4.888m11.712-1.445a5.16 5.16 0 0 0-4.891-4.067a5.01 5.01 0 0 0-4.891 4.067a1.008 1.008 0 0 0 .978 1.251h7.826a1.01 1.01 0 0 0 .978-1.251m-11.162 2.099H2.959a1.012 1.012 0 0 0-.979 1.252a5.164 5.164 0 0 0 4.892 4.067a5.01 5.01 0 0 0 4.891-4.067a1.01 1.01 0 0 0-.979-1.252',
+  flash:'M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377',
+  sentry:'M12 2a10 10 0 1 0 10 10A10.01 10.01 0 0 0 12 2m0 18.187A8.187 8.187 0 1 1 20.187 12A8.2 8.2 0 0 1 12 20.187M18.638 12A6.64 6.64 0 0 1 12 18.638A6.64 6.64 0 0 1 5.362 12A6.64 6.64 0 0 1 12 5.362A6.64 6.64 0 0 1 18.638 12',
+  hood:'m19.99 16.3l-4.6-.021c0-.044.006-.086.006-.131a5.017 5.017 0 1 0-10.033 0v.085L3.9 16.227v-3.083a1.36 1.36 0 0 1 1.066-1.33l3.021-.965a15 15 0 0 1 4.233-.709l3-.068a4.9 4.9 0 0 0 2.046-.366l3.851-1.917c.7-.371 1.128-.816.757-1.514c-.275-.516-1.468-.224-1.985.051L16.467 7.7c-.168.09-.339.164-.488.227a16 16 0 0 0-5.109-3.761A14.36 14.36 0 0 0 4.3 2.848a1.5 1.5 0 0 0-.878.282a.74.74 0 0 0-.287.656a1.34 1.34 0 0 0 .816.967a2.9 2.9 0 0 0 1.406.318l.218-.007c.171-.006.342-.014.519-.008a11.2 11.2 0 0 1 7.09 3.089a17 17 0 0 0-5.127.744c-.8.194-1.6.428-2.376.7l-1.53.528A3.185 3.185 0 0 0 2 13.125v3.764c0 1.145.511 1.452 1.7 1.453l2.187.022a5.007 5.007 0 0 0 8.946.091l5.23.052A1.174 1.174 0 0 0 21.3 17.45a1.175 1.175 0 0 0-1.31-1.15m-7.09-.031a2.52 2.52 0 0 1-1.426 2.152a2.43 2.43 0 0 1-2.22-.023a2.52 2.52 0 0 1-1.388-2.153c0-.032-.009-.063-.009-.1a2.528 2.528 0 1 1 5.055 0c-.002.045-.012.083-.012.124',
+  trunk:'m21.548 13.363l-.248-.473l.013-1.291c.005-.206.27-.022.339-.215l.255-.891c.34-.635-.577-1.621-.912-1.557l-3.267-.687a11.4 11.4 0 0 1-1.768-.525l-.267-.1L17.986 5.3a.816.816 0 0 1 1.322.135l.307.377a1.115 1.115 0 0 0 1.582.148a.87.87 0 0 0 .078-1.254l-1.424-1.343a1.574 1.574 0 0 0-2.41 0l-3.67 3.514l-5.249-2.034a5.9 5.9 0 0 0-2.139-.4H3.046a1.046 1.046 0 0 0 0 2.092H6.1a5.4 5.4 0 0 1 1.932.365l7.121 2.758a13.5 13.5 0 0 0 2.035.608l.652.14c.7.152 1.844.126 1.5.759l-.229.436l.017 1.651l.566.993A1.1 1.1 0 0 1 20 15v.585a1.08 1.08 0 0 1-1.08 1.08h-1.152c.013-.129.028-.256.032-.387c0-.045.007-.088.007-.132a5.062 5.062 0 1 0-10.124 0v.085c0 .147.017.29.032.434H3.046a1.047 1.047 0 0 0 0 2.093h5.383a5.027 5.027 0 0 0 8.633 0h2.3c1.509 0 2.613-.681 2.613-2.189L22 14.325a1.8 1.8 0 0 0-.452-.962M10.2 16.238c0-.032-.01-.063-.01-.1a2.551 2.551 0 1 1 5.1 0c0 .041-.01.079-.012.12a2.5 2.5 0 0 1-.053.4a2.55 2.55 0 0 1-1.386 1.773a2.46 2.46 0 0 1-2.24-.023a2.57 2.57 0 0 1-1.4-2.173z'
+};
+function ico(n){ return '<svg class="ic" viewBox="0 0 24 24"><path d="'+IC[n]+'"/></svg>'; }
+let ST={locked:false,clim:false,chg:false,sentry:false,frunkOpen:false,trunkOpen:false};
+function paintToggles(){
+  const b=(id,on,ic,onTxt,offTxt)=>{ const e=$(id); if(!e)return; e.innerHTML=ico(ic)+(on?onTxt:offTxt); e.classList.toggle('active',on); };
+  b('btnLock',!ST.locked,'lock','잠금 해제','잠금');
+  b('btnClim',ST.clim,'fan','공조 ON','공조 OFF');
+  b('btnChg',ST.chg,'open','충전구 열림','충전구');
+  b('btnSentry',ST.sentry,'sentry','감시 ON','감시 OFF');
+  b('btnFrunk',ST.frunkOpen,'hood','프렁크 열림','프렁크');
+  b('btnTrunk',ST.trunkOpen,'trunk','트렁크 열림','트렁크');
+}
+function tgl(kind){
+  const m={
+    lock:()=>{ST.locked=!ST.locked; cmd(ST.locked?'lock':'unlock', ST.locked?'잠금':'해제');},
+    clim:()=>{ST.clim=!ST.clim; cmd(ST.clim?'climate_on':'climate_off','공조 '+(ST.clim?'ON':'OFF'));},
+    chg:()=>{ST.chg=!ST.chg; cmd(ST.chg?'charge_port_open':'charge_port_close','충전구 '+(ST.chg?'열기':'닫기'));},
+    sentry:()=>{ST.sentry=!ST.sentry; act('/api/sentry?on='+ST.sentry,'감시 '+(ST.sentry?'ON':'OFF'));},
+    frunk:async ()=>{ if(!await confirmModal('프렁크를 여시겠습니까?')) return; ST.frunkOpen=!ST.frunkOpen; act('/api/trunk?which=front','프렁크');},
+    trunk:async ()=>{ if(!await confirmModal('트렁크를 여시겠습니까?')) return; ST.trunkOpen=!ST.trunkOpen; act('/api/trunk?which=rear','트렁크');},
+  };
+  if(m[kind]){ m[kind](); paintToggles(); setTimeout(refresh,1800); }
+}
+async function wake(){ toast('☀️ 깨우는 중…'); try{ await fetch(q('/api/command/wake'),{method:'POST'}); toast('☀️ 깨우기 전송'); setTimeout(refresh,4000); setTimeout(refresh,10000); }catch(e){ toast('❌ 연결 실패'); } }
+
+async function refresh(){
+  $('updated').textContent='불러오는 중…';
+  try{
+    const r=await fetch(q('/api/state'));
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok || !j.response){ $('conn').textContent='💤 자는 중 · 깨우기'; $('conn').className='pill sleeping'; $('updated').textContent='차량 잠듦 — 배지 탭하여 깨우기'; return; }
+    const d=j.response;
+    const cs=d.charge_state||{}, cl=d.climate_state||{}, vs=d.vehicle_state||{}, ds=d.drive_state||{};
+    if(d.vin){ const ve=$('vin'); ve.textContent='VIN  '+d.vin; ve.setAttribute('data-vin',d.vin); }
+    // 배터리/주행
+    if(cs.battery_level!=null){ $('soc').textContent=cs.battery_level; $('socbar').style.width=cs.battery_level+'%'; }
+    if(cs.battery_range!=null) $('range').textContent=Math.round(cs.battery_range*MI);
+    if(cs.charge_limit_soc!=null){ $('limtxt').textContent=cs.charge_limit_soc; $('limmark').style.left=cs.charge_limit_soc+'%'; $('limslider').value=cs.charge_limit_soc; $('limval').textContent=cs.charge_limit_soc; }
+    if(vs.odometer!=null) $('odo').textContent=Math.round(vs.odometer*MI).toLocaleString();
+    if(cl.inside_temp!=null) $('itemp').textContent=cl.inside_temp.toFixed(1);
+    if(cl.outside_temp!=null) $('otemp').textContent=cl.outside_temp.toFixed(1);
+    if(cl.driver_temp_setting!=null) $('ttemp').textContent=cl.driver_temp_setting.toFixed(0);
+    // 상태
+    let st=[]; st.push(vs.locked?'잠김':'열림'); if(cl.is_climate_on) st.push('공조중');
+    $('state').textContent=st.join(' · ');
+    // 충전
+    const charging = cs.charging_state==='Charging';
+    $('chgbadge').textContent = ({Charging:'충전중',Complete:'완료',Stopped:'중지',Disconnected:'미연결',NoPower:'대기'}[cs.charging_state]||cs.charging_state||'–');
+    $('chgbadge').className = 'pill'+(charging?' on':'');
+    $('chgstate').textContent = charging?('충전중 '+(cs.charger_power||0)+'kW'):(cs.charging_state==='Complete'?'충전 완료':'미충전');
+    $('ckw').textContent = cs.charger_power!=null?cs.charger_power:'–';
+    $('ctarget').textContent = cs.charge_limit_soc!=null?cs.charge_limit_soc:'–';
+    $('cadded').textContent = cs.charge_energy_added!=null?cs.charge_energy_added.toFixed(1):'–';
+    $('addedk').textContent = charging?'이번 충전 추가':'마지막 충전 추가';
+    const m=cs.minutes_to_full_charge!=null?cs.minutes_to_full_charge:(cs.time_to_full_charge?cs.time_to_full_charge*60:0);
+    $('cfull').textContent = (charging&&m>0)?(Math.floor(m/60)+'시간 '+Math.round(m%60)+'분'):'–';
+    // 타이어
+    tire('tfl','wtfl',vs.tpms_pressure_fl); tire('tfr','wtfr',vs.tpms_pressure_fr); tire('trl','wtrl',vs.tpms_pressure_rl); tire('trr','wtrr',vs.tpms_pressure_rr);
+    updateSeats(cl);
+    // on/off 현재 상태 반영
+    ST.locked=!!vs.locked; ST.clim=!!cl.is_climate_on; ST.chg=!!cs.charge_port_door_open; ST.sentry=!!vs.sentry_mode;
+    ST.frunkOpen=(vs.ft!=null && vs.ft!==0); ST.trunkOpen=(vs.rt!=null && vs.rt!==0);
+    paintToggles();
+    // 위치
+    if(ds.latitude!=null && ds.longitude!=null){
+      const la=ds.latitude, lo=ds.longitude;
+      const bb=(lo-0.006)+','+(la-0.0035)+','+(lo+0.006)+','+(la+0.0035);
+      $('map').src='https://www.openstreetmap.org/export/embed.html?bbox='+bb+'&layer=mapnik&marker='+la+','+lo;
+      $('maplink').href='https://www.google.com/maps/search/?api=1&query='+la+','+lo;
+      $('loctxt').textContent=la.toFixed(5)+', '+lo.toFixed(5);
+      $('locbadge').textContent='실시간'; $('locbadge').className='pill on';
+    } else {
+      $('loctxt').innerHTML='위치 권한(vehicle_location)이 필요합니다 — 재로그인 후 표시됩니다';
+      $('locbadge').textContent='권한 필요'; $('locbadge').className='pill';
+    }
+    if(j.cached){
+      const mm = j.cached_at!=null ? Math.round((Date.now()/1000 - j.cached_at)/60) : null;
+      $('conn').textContent = '💤 '+(mm!=null ? (mm<1?'방금':mm+'분 전') : '캐시')+' · 깨우기';
+      $('conn').className='pill sleeping';
+      $('updated').textContent = (mm!=null ? (mm<1?'방금':mm+'분 전')+' 정보 (자는 중·배지 탭하여 깨우기)' : '마지막 정보');
+    } else {
+      $('conn').textContent='● 온라인'; $('conn').className='pill on';
+      $('updated').textContent=new Date().toLocaleTimeString('ko-KR');
+    }
+  }catch(e){ $('conn').textContent='오프라인'; $('conn').className='pill'; $('updated').textContent='연결 실패'; }
+}
+// 모던 확인 모달 (구식 confirm 대체)
+function confirmModal(msg){
+  return new Promise((resolve)=>{
+    const m=$('modal'); $('modalmsg').textContent=msg; m.classList.add('on');
+    const done=(v)=>{ m.classList.remove('on'); $('mok').onclick=null; $('mcancel').onclick=null; m.onclick=null; resolve(v); };
+    $('mok').onclick=()=>done(true);
+    $('mcancel').onclick=()=>done(false);
+    m.onclick=(e)=>{ if(e.target===m) done(false); };
+  });
+}
+
+// 프렁크/트렁크: 롱프레스(600ms) → tgl()이 확인창까지. 짧게 누르면 안내.
+function attachLongPress(el, fn){
+  if(!el) return;
+  const HOLD=600;
+  let timer=null, fired=false;
+  const setFill=(pct,ms)=>{ el.style.transition='--fill '+ms+'ms linear'; el.style.setProperty('--fill',pct); };
+  const start=()=>{ fired=false; setFill('100%',HOLD); timer=setTimeout(()=>{ fired=true; setFill('0%',150); fn(); }, HOLD); };
+  const cancel=()=>{ if(timer){ clearTimeout(timer); timer=null; } setFill('0%',150); };
+  el.addEventListener('touchstart', start, {passive:true});
+  el.addEventListener('touchend', cancel);
+  el.addEventListener('touchmove', cancel);
+  el.addEventListener('touchcancel', cancel);
+  el.addEventListener('mousedown', start);
+  el.addEventListener('mouseup', cancel);
+  el.addEventListener('mouseleave', cancel);
+  el.addEventListener('click', (e)=>{ e.preventDefault(); if(!fired) toast('길게 눌러 여세요'); });
+  el.addEventListener('contextmenu', (e)=>e.preventDefault());   // 롱프레스 텍스트선택/복사 팝업 차단
+}
+attachLongPress($('btnFrunk'), ()=>tgl('frunk'));
+attachLongPress($('btnTrunk'), ()=>tgl('trunk'));
+
+// 차대번호 롱프레스 복사
+function copyVin(){
+  const v=($('vin').getAttribute('data-vin'))||''; if(!v) return;
+  const ok=()=>toast('차대번호 복사됨');
+  if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(v).then(ok).catch(()=>fallbackCopy(v,ok)); }
+  else fallbackCopy(v,ok);
+}
+function fallbackCopy(t,cb){ const ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.focus(); ta.select(); try{ document.execCommand('copy'); cb(); }catch(e){ toast('복사 실패'); } document.body.removeChild(ta); }
+(function(){ const e=$('vin'); if(!e) return; let t=null;
+  const s=()=>{ t=setTimeout(copyVin,600); }; const c=()=>{ if(t){clearTimeout(t);t=null;} };
+  e.addEventListener('touchstart',s,{passive:true}); e.addEventListener('touchend',c); e.addEventListener('touchmove',c); e.addEventListener('touchcancel',c);
+  e.addEventListener('mousedown',s); e.addEventListener('mouseup',c); e.addEventListener('mouseleave',c);
+  e.addEventListener('contextmenu',(ev)=>ev.preventDefault());
+})();
+
+if(!KEY) toast('⚠️ URL에 ?key=토큰 이 필요합니다');
+paintToggles();
+refresh();
+setInterval(refresh,60000);
+</script>
+</body>
+</html>"""
+
+
+# ════════════════════════════════════════════════════════════════
+#  갤럭시워치(Wear OS) 대시보드 — 480×480 원형 기준
+#  기초 스캐폴딩: 스테이지 스케일 맞춤, 화면전환 프레임워크, 연결확인
+# ════════════════════════════════════════════════════════════════
+WATCH_HTML = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Tesla Watch</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; -webkit-user-select:none; user-select:none; }
+  html, body { width:100%; height:100%; background:#151515; overflow:hidden;
+    font-family:-apple-system,'Roboto','Noto Sans KR',sans-serif; color:#e8e8e8;
+    display:flex; align-items:center; justify-content:center; }
+  /* 480 기준 디자인을 실제 워치 해상도에 맞춰 축소(잘림 방지) */
+  #stage { position:relative; width:480px; height:480px; border-radius:50%;
+    overflow:hidden; background:#151515; transform-origin:center center; }
+  .screen { position:absolute; inset:0; display:none; }
+  .screen.on { display:block; }
+  .bg { position:absolute; inset:0; width:480px; height:480px; object-fit:cover; pointer-events:none; }
+  /* 부팅/연결 오버레이 */
+  #boot { position:absolute; inset:0; z-index:60; background:#151515;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; }
+  .spin { width:46px; height:46px; border:4px solid rgba(255,255,255,.12);
+    border-top-color:#e82127; border-radius:50%; animation:sp .9s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  #bootmsg { color:#8a8c8b; font-size:15px; letter-spacing:1px; }
+  /* 색상 토큰 (꺼짐 회색 / 켜짐 색상) */
+  :root { --off:#8a8c8b; }
+
+  /* ── 화면1: 메인 ── */
+  .batt { position:absolute; left:50%; top:14px; transform:translateX(-50%);
+    display:flex; flex-direction:column; align-items:center; gap:3px; z-index:5; }
+  .battpct { font-size:23px; font-weight:700; color:#f0f0f0; letter-spacing:.5px; }
+  .navlbl { position:absolute; transform:translateX(-50%); color:#dcdcdc;
+    font-size:25px; font-weight:600; padding:10px 14px; cursor:pointer; z-index:5; }
+  .navlbl:active { color:#fff; }
+  .dline { position:absolute; width:0; border-left:2px dashed #7d7f7e;
+    transform:translateX(-1px); pointer-events:none; z-index:4; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div id="scr1" class="screen on">
+      <img class="bg" src="/w/s1.png">
+      <!-- 배터리 (상단 중앙) -->
+      <div class="batt">
+        <svg viewBox="0 0 48 24" width="46" height="23">
+          <rect x="1" y="4" width="40" height="16" rx="3" ry="3" fill="none" stroke="#e8e8e8" stroke-width="2"/>
+          <rect x="43" y="9" width="3.5" height="6" rx="1" fill="#e8e8e8"/>
+          <rect id="battfill" x="4" y="7" width="0" height="10" rx="1.5" fill="#b8bab9"/>
+        </svg>
+        <div class="battpct"><span id="s1soc">–</span>%</div>
+      </div>
+      <!-- 제어 (좌) : 차량 본네트 → 위로 라벨 -->
+      <div class="dline" style="left:80px; top:134px; height:120px;"></div>
+      <div class="navlbl" id="navCtl" style="left:80px; top:76px;">제어</div>
+      <!-- 상태 (우) -->
+      <div class="dline" style="left:376px; top:108px; height:78px;"></div>
+      <div class="navlbl" id="navStat" style="left:376px; top:52px;">상태</div>
+      <!-- 공조 (하) : 차량 → 아래로 라벨 -->
+      <div class="dline" style="left:282px; top:300px; height:98px;"></div>
+      <div class="navlbl" id="navHvac" style="left:282px; top:404px;">공조</div>
+    </div>
+    <div id="scr2" class="screen"><img class="bg" src="/w/s2.png"></div>
+    <div id="scr3" class="screen"><img class="bg" src="/w/s3.png"></div>
+    <div id="boot"><div class="spin"></div><div id="bootmsg">연결 중…</div></div>
+  </div>
+<script>
+const KEY = new URLSearchParams(location.search).get('key') || '';
+function q(p){ return p + (p.includes('?')?'&':'?') + 'key=' + encodeURIComponent(KEY); }
+async function api(p){ const r = await fetch(q(p)); if(!r.ok) throw new Error(r.status); return r.json(); }
+async function post(p){ const r = await fetch(q(p), {method:'POST'}); return r.ok; }
+
+// 480 디자인을 실제 화면에 꽉 맞게(원형 잘림 없이) 스케일
+function fit(){
+  const w = window.innerWidth || 0, h = window.innerHeight || 0;
+  const s = Math.min(w, h) / 480;
+  if (s > 0.05) document.getElementById('stage').style.transform = 'scale(' + s + ')';
+}
+fit();
+window.addEventListener('resize', fit);
+window.addEventListener('load', fit);
+setTimeout(fit, 120); setTimeout(fit, 400);
+
+// 화면 전환 프레임워크
+let CUR = 1;
+function show(n){
+  CUR = n;
+  for(const i of [1,2,3]) document.getElementById('scr'+i).classList.toggle('on', i===n);
+}
+
+// 워치 물리 뒤로가기 → 메인 아니면 메인으로, 메인이면 앱 종료 (네이티브에서 호출)
+window.handleBack = function(){
+  if (CUR !== 1) { show(1); }
+  else { try { AndroidApp.exit(); } catch(e) {} }
+};
+
+// 차량 상태 캐시
+let STATE = null;
+
+// 화면1: 배터리 렌더
+function renderMain(){
+  const soc = (STATE && STATE.charge_state) ? STATE.charge_state.battery_level : null;
+  document.getElementById('s1soc').textContent = (soc!=null ? soc : '–');
+  const f = document.getElementById('battfill');
+  if (soc!=null) {
+    f.setAttribute('width', (34 * Math.max(0,Math.min(100,soc)) / 100).toFixed(1));
+    f.setAttribute('fill', soc<=15 ? '#e82127' : '#b8bab9');
+  } else {
+    f.setAttribute('width', 0);
+  }
+}
+
+// 상태 조회
+async function refreshState(){
+  try {
+    const j = await api('/api/state');
+    STATE = j.response || {};
+    renderMain();
+    return true;
+  } catch(e) { return false; }
+}
+
+// 부팅
+async function boot(){
+  const ok = await refreshState();
+  if (ok) {
+    document.getElementById('bootmsg').textContent = '연결됨';
+    setTimeout(function(){ document.getElementById('boot').style.display='none'; }, 500);
+  } else {
+    document.getElementById('bootmsg').textContent = '연결 실패 — 재시도 중';
+    setTimeout(boot, 2500);
+  }
+}
+
+// 네비게이션 (제어→화면2, 공조→화면3, 상태→동작없음)
+document.getElementById('navCtl').addEventListener('click', function(){ show(2); });
+document.getElementById('navHvac').addEventListener('click', function(){ show(3); });
+document.getElementById('navStat').addEventListener('click', function(){ /* 상태: 미구현 */ });
+
+boot();
+setInterval(refreshState, 60000);
+</script>
+</body>
+</html>"""

@@ -1,0 +1,5 @@
+name: "Tesla"
+packageKey: "tesla-bridge-st"
+description: "Tesla 차량 제어 (로컬 브릿지)"
+permissions:
+  lan: {}

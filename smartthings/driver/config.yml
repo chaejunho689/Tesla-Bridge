@@ -1,0 +1,5 @@
+name: "Tesla Bridge"
+packageKey: "tesla-bridge"
+description: "로컬 브릿지를 통해 Tesla 차량 제어 (잠금/공조/충전)"
+permissions:
+  lan: {}
