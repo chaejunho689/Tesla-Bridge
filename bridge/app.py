@@ -9,13 +9,19 @@ Tesla ↔ SmartThings 브릿지.
 """
 import asyncio
 import json
+import math
 import os
 import time
 import secrets
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
+try:
+    import asyncpg
+except Exception:
+    asyncpg = None
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, FileResponse, Response
 
@@ -34,6 +40,14 @@ SCOPES = os.environ.get(
 )
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 DEFAULT_VIN = os.environ.get("TESLA_VIN", "")
+
+# TeslaMate DB (충전 세션 조회)
+TM_DB_HOST = os.environ.get("TESLAMATE_DB_HOST", "")
+TM_DB_PORT = int(os.environ.get("TESLAMATE_DB_PORT", "5432"))
+TM_DB_USER = os.environ.get("TESLAMATE_DB_USER", "teslamate")
+TM_DB_PASS = os.environ.get("TESLAMATE_DB_PASS", "")
+TM_DB_NAME = os.environ.get("TESLAMATE_DB_NAME", "teslamate")
+TM_CAR_ID  = int(os.environ.get("TESLAMATE_CAR_ID", "1"))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 TOKENS_FILE = DATA_DIR / "tokens.json"
@@ -298,17 +312,30 @@ async def state(request: Request, vin: str = Query("")):
         data = _safe_json(r)
         if isinstance(data, dict) and data.get("response"):
             now = time.time()
+            resp = data["response"]
             try:
-                cache_file.write_text(json.dumps({"response": data["response"], "cached_at": now}))
+                cache_file.write_text(json.dumps({"response": resp, "cached_at": now}))
             except Exception:
                 pass
-            return JSONResponse({"response": data["response"], "cached": False, "cached_at": now})
+            cost = None
+            try:
+                cost = await _compute_charge_cost(resp.get("charge_state") or {}, resp.get("drive_state") or {})
+            except Exception:
+                pass
+            return JSONResponse({"response": resp, "cached": False, "cached_at": now,
+                                 "charge_cost": cost})
     # 실패(잠자는 중 등) → 마지막 캐시 반환
     if cache_file.exists():
         try:
             c = json.loads(cache_file.read_text())
+            cost = None
+            try:
+                resp = c["response"]
+                cost = await _compute_charge_cost(resp.get("charge_state") or {}, resp.get("drive_state") or {})
+            except Exception:
+                pass
             return JSONResponse({"response": c["response"], "cached": True,
-                                 "cached_at": c.get("cached_at")})
+                                 "cached_at": c.get("cached_at"), "charge_cost": cost})
         except Exception:
             pass
     return JSONResponse(_safe_json(r), status_code=r.status_code)
@@ -418,6 +445,58 @@ async def sentry(request: Request, vin: str = Query(""), on: bool = Query(True))
     async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
         r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json={"on": on})
     return JSONResponse(_safe_json(r), status_code=r.status_code)
+
+
+# ── 충전 요금 관리 (Claude가 등록/수정) ────────────────────────────
+@app.get("/api/charge/info")
+async def charge_info(request: Request):
+    require_bridge_auth(request)
+    rows = await _tm_fetch(
+        """SELECT cp.id, (cp.start_date + interval '9 hours') AS start_kst,
+                  g.name AS loc, cp.charge_energy_added AS kwh, cp.cost AS tm_cost
+             FROM charging_processes cp
+             LEFT JOIN geofences g ON g.id = cp.geofence_id
+            WHERE cp.car_id = $1 AND cp.charge_energy_added > 0
+            ORDER BY cp.start_date DESC LIMIT 30""",
+        TM_CAR_ID)
+    sessions = [{"id": r["id"], "start": str(r["start_kst"]), "loc": r["loc"],
+                 "kwh": float(r["kwh"] or 0), "tm_cost": (float(r["tm_cost"]) if r["tm_cost"] is not None else None)}
+                for r in rows]
+    return JSONResponse({"rates": _load_rates(), "teslamate_sessions": sessions})
+
+@app.post("/api/charge/location")
+async def charge_location(request: Request, name: str = Query(...),
+                          lat: float = Query(...), lon: float = Query(...),
+                          radius_m: int = Query(100), cycle_day: int = Query(0)):
+    """위치 추가/수정. cycle_day>0이면 청구주기 시작일(집 전용)."""
+    require_bridge_auth(request)
+    d = _load_rates()
+    loc = next((x for x in d["locations"] if x["name"] == name), None)
+    if not loc:
+        loc = {"name": name, "rates": []}
+        d["locations"].append(loc)
+    loc.update({"lat": lat, "lon": lon, "radius_m": radius_m})
+    if cycle_day > 0:
+        loc["cycle_day"] = cycle_day
+    _save_rates(d)
+    return JSONResponse({"ok": True, "location": loc})
+
+@app.post("/api/charge/rate")
+async def charge_rate(request: Request, name: str = Query(...),
+                      won: float = Query(...), from_date: str = Query(..., alias="from")):
+    """위치의 요금(원/kWh)을 특정 시점부터 적용."""
+    require_bridge_auth(request)
+    d = _load_rates()
+    loc = next((x for x in d["locations"] if x["name"] == name), None)
+    if not loc:
+        raise HTTPException(404, f"위치 '{name}' 없음 — /api/charge/location 먼저")
+    loc.setdefault("rates", [])
+    loc["rates"] = [r for r in loc["rates"] if r.get("from") != from_date]
+    loc["rates"].append({"from": from_date, "won": won})
+    loc["rates"].sort(key=lambda x: x.get("from", ""))
+    _save_rates(d)
+    return JSONResponse({"ok": True, "rates": loc["rates"]})
+
 
 
 def _safe_json(r: httpx.Response):
@@ -559,6 +638,146 @@ async def _st_event(device_id, component, capability, attribute, value, unit=Non
                          json={"deviceEvents": [ev]})
     except Exception:
         pass
+
+
+# ══════════ 충전 요금 계산 (위치별 요금표 + TeslaMate 세션 집계) ══════════
+RATES_FILE  = DATA_DIR / "charge_rates.json"
+
+def _seed_rates() -> dict:
+    return {"locations": [
+        {"name": "집", "lat": 37.59262, "lon": 127.08531, "radius_m": 100,
+         "cycle_day": 9, "rates": [{"from": "2026-01-01", "won": 0}]}
+    ]}
+
+def _load_rates() -> dict:
+    if RATES_FILE.exists():
+        try:
+            return json.loads(RATES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    d = _seed_rates()
+    _save_rates(d)
+    return d
+
+def _save_rates(d: dict) -> None:
+    try:
+        RATES_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+def _match_location(lat, lon):
+    if lat is None or lon is None:
+        return None
+    for loc in _load_rates().get("locations", []):
+        try:
+            if _haversine(lat, lon, loc["lat"], loc["lon"]) <= loc.get("radius_m", 100):
+                return loc
+        except Exception:
+            continue
+    return None
+
+def _get_location(name):
+    for loc in _load_rates().get("locations", []):
+        if loc.get("name") == name:
+            return loc
+    return None
+
+def _rate_for(name, date_str) -> float:
+    loc = _get_location(name)
+    if not loc:
+        return 0.0
+    best = 0.0
+    for r in sorted(loc.get("rates", []), key=lambda x: x.get("from", "")):
+        if r.get("from", "0000-01-01") <= date_str:
+            best = r.get("won", 0)
+    return best
+
+def _home_cycle_bounds(cycle_day=9, today=None):
+    """집 요금 청구 주기: 매월 cycle_day(9일) ~ 다음달 (cycle_day-1)일(8일)"""
+    today = today or date.today()
+    if today.day >= cycle_day:
+        start = today.replace(day=cycle_day)
+    else:
+        first = today.replace(day=1)
+        start = (first - timedelta(days=1)).replace(day=cycle_day)
+    nxt = start.replace(year=start.year+1, month=1) if start.month == 12 \
+        else start.replace(month=start.month+1)
+    end = nxt - timedelta(days=1)
+    return start, end
+
+def _kst_today() -> date:
+    return (datetime.utcnow() + timedelta(hours=9)).date()
+
+# ── TeslaMate DB 연결 풀 ──
+_tm_pool = None
+async def _tm_fetch(sql, *args):
+    global _tm_pool
+    if asyncpg is None or not TM_DB_HOST:
+        return []
+    try:
+        if _tm_pool is None:
+            _tm_pool = await asyncpg.create_pool(
+                host=TM_DB_HOST, port=TM_DB_PORT, user=TM_DB_USER,
+                password=TM_DB_PASS, database=TM_DB_NAME, min_size=1, max_size=3)
+        async with _tm_pool.acquire() as con:
+            return await con.fetch(sql, *args)
+    except Exception:
+        return []
+
+async def _compute_charge_cost(cs, ds):
+    """이번 충전 = 차량 실시간 값 × 현재 위치 요금.
+       이번달 = TeslaMate charging_processes 집계 (집: 9~8일 주기, 집외: 당월)."""
+    lat, lon = ds.get("latitude"), ds.get("longitude")
+    lm = _match_location(lat, lon)
+    locname = lm["name"] if lm else "기타"
+    energy = cs.get("charge_energy_added") or 0
+    rate_now = _rate_for(locname, _kst_today().isoformat()) if lm else 0
+    session_won = round(energy * rate_now)
+
+    home = _get_location("집")
+    cd = home.get("cycle_day", 9) if home else 9
+    cstart, cend = _home_cycle_bounds(cd, _kst_today())
+    tod = _kst_today()
+    mstart = tod.replace(day=1)
+
+    lower = min(cstart, mstart)
+    rows = await _tm_fetch(
+        """SELECT (cp.start_date + interval '9 hours')::date AS kst_date,
+                  g.name AS loc, cp.charge_energy_added AS kwh, cp.cost AS tm_cost
+             FROM charging_processes cp
+             LEFT JOIN geofences g ON g.id = cp.geofence_id
+            WHERE cp.car_id = $1 AND cp.charge_energy_added > 0
+              AND (cp.start_date + interval '9 hours')::date >= $2
+            ORDER BY cp.start_date""",
+        TM_CAR_ID, lower)
+
+    month_won = 0
+    month_kwh = 0.0
+    for r in rows:
+        sd = r["kst_date"]
+        kwh = float(r["kwh"] or 0)
+        loc = r["loc"]
+        if loc == "집":
+            if cstart <= sd <= cend:
+                month_won += round(kwh * _rate_for("집", sd.isoformat()))
+                month_kwh += kwh
+        else:
+            if sd.year == tod.year and sd.month == tod.month:
+                month_won += int(round(float(r["tm_cost"]))) if r["tm_cost"] is not None else 0
+                month_kwh += kwh
+
+    return {"location": locname, "session_won": session_won,
+            "session_kwh": round(energy, 2), "month_won": month_won,
+            "month_kwh": round(month_kwh, 2),
+            "cycle": f"{cstart.isoformat()}~{cend.isoformat()}"}
 
 
 async def _fetch_and_cache(vin):
@@ -791,7 +1010,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   h1 { font-size:22px; margin:4px 0 2px; display:flex; align-items:center; gap:8px; }
   .sub { color:var(--sub); font-size:13px; margin-bottom:16px; }
   .card { background:var(--card); border-radius:16px; padding:16px; margin-bottom:14px; }
-  .cardh { font-size:13px; color:var(--sub); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; }
+  .cardh { font-size:13px; color:var(--sub); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   .stat { background:var(--card2); border-radius:12px; padding:12px; }
   .stat .k { color:var(--sub); font-size:12px; }
@@ -802,6 +1021,16 @@ DASHBOARD_HTML = r"""<!doctype html>
   .bar { height:10px; background:var(--card2); border-radius:6px; overflow:hidden; margin:14px 0 6px; position:relative; }
   .bar > i { display:block; height:100%; background:linear-gradient(90deg,#2ecc71,#27ae60); width:0%; transition:width .5s; }
   .bar > .lim { position:absolute; top:-3px; width:2px; height:16px; background:var(--amber); }
+  /* 충전 중: 회색(빈) 구간의 100%지점 → 현재잔량 경계까지 흰 세로선이 우→좌로 가속 이동 */
+  #chgspark { position:absolute; top:0; bottom:0; right:0; left:0; display:none; pointer-events:none; }
+  .bar.charging > #chgspark { display:block; }
+  #chgspark::before {
+    content:''; position:absolute; top:0; bottom:0; width:3px; background:#2ecc71;
+    animation:chgspark .7s cubic-bezier(.55,0,.9,.45) infinite;
+  }
+  @keyframes chgspark { from{ left:100%; } to{ left:0%; } }
+  .barfoot { position:relative; color:var(--sub); font-size:12px; min-height:16px; }
+  .eta { position:absolute; top:0; transform:translateX(-50%); white-space:nowrap; color:#f5c518; font-weight:600; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
   button { border:0; border-radius:12px; padding:15px 10px; font-size:15px; font-weight:600; color:#fff; background:var(--card2); cursor:pointer; transition:transform .05s, opacity .2s; }
   button:active { transform:scale(.96); }
@@ -860,6 +1089,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tb .v { font-size:22px; font-weight:600; margin-top:4px; }
   /* SVG 다이어그램 (타이어/시트 실루엣) */
   .diagram { display:block; width:100%; max-width:220px; margin:2px auto; }
+  .diagram-wide { max-width:100%; }
   .psi { fill:var(--txt); font:700 17px sans-serif; }
   .psi.warn { fill:var(--amber); }
   .lab { fill:var(--sub); font:400 10px sans-serif; }
@@ -887,10 +1117,20 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div style="color:var(--sub); font-size:13px; margin-top:2px" id="chgstate">–</div>
       </div>
     </div>
-    <div class="bar"><i id="socbar"></i><span class="lim" id="limmark"></span></div>
-    <div style="display:flex; justify-content:space-between; color:var(--sub); font-size:12px">
+    <div class="bar"><i id="socbar"></i><b id="chgspark"></b><span class="lim" id="limmark"></span></div>
+    <div class="barfoot">
       <span>목표 <span id="limtxt">–</span>%</span>
-      <span id="updated">불러오는 중…</span>
+      <span id="eta" class="eta"></span>
+    </div>
+    <span id="updated" style="display:none"></span>
+  </div>
+
+  <!-- 목표 온도 (내기/외기 위) -->
+  <div class="card" id="tempCard">
+    <div class="slider">
+      <label>목표 온도 <b><span id="tempval">21</span>°C</b></label>
+      <input type="range" min="15" max="28" value="21" id="tempslider" oninput="tempval.textContent=this.value">
+      <button class="wide" style="margin-top:10px" onclick="setTemp()">온도 설정</button>
     </div>
   </div>
 
@@ -911,64 +1151,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- 충전 상세 -->
-  <div class="card" id="chgcard">
-    <div class="cardh"><svg class="cih" viewBox="0 0 24 24"><path d="m17.635 9.991l-4.938-.1l-.064-7.01c.067-.958-.633-1.4-1.366.059l-5.629 9.53c-.648 1.046-.557 1.41.625 1.524h5l.131 6.573c-.017 1.41.574 2.16 1.438.432l5.686-9.735c.482-.728.282-1.251-.883-1.273"/></svg>충전 <span id="chgbadge" class="pill">–</span></div>
-    <div class="stats">
-      <div class="stat"><div class="k">충전 속도</div><div class="v"><span id="ckw">–</span> <small>kW</small></div></div>
-      <div class="stat"><div class="k">목표 충전량</div><div class="v"><span id="ctarget">–</span> <small>%</small></div></div>
-      <div class="stat"><div class="k" id="addedk">추가된 양</div><div class="v"><span id="cadded">–</span> <small>kWh</small></div></div>
-      <div class="stat"><div class="k">완충까지</div><div class="v" style="font-size:16px"><span id="cfull">–</span></div></div>
-    </div>
-  </div>
-
-  <!-- 타이어 (차체 하부 실루엣) -->
-  <div class="card">
-    <div class="cardh">🛞 타이어 공기압 <span class="pill">PSI</span></div>
-    <svg class="diagram" viewBox="0 0 220 290">
-      <rect x="50" y="24" width="120" height="242" rx="44" fill="#33373c"/>
-      <rect id="wtfl" x="28" y="52" width="26" height="54" rx="12" fill="#4a4f55"/>
-      <rect id="wtfr" x="166" y="52" width="26" height="54" rx="12" fill="#4a4f55"/>
-      <rect id="wtrl" x="28" y="184" width="26" height="54" rx="12" fill="#4a4f55"/>
-      <rect id="wtrr" x="166" y="184" width="26" height="54" rx="12" fill="#4a4f55"/>
-      <text id="tfl" class="psi" x="88" y="72" text-anchor="middle">–</text><text class="lab" x="88" y="88" text-anchor="middle">앞좌</text>
-      <text id="tfr" class="psi" x="132" y="72" text-anchor="middle">–</text><text class="lab" x="132" y="88" text-anchor="middle">앞우</text>
-      <text id="trl" class="psi" x="88" y="220" text-anchor="middle">–</text><text class="lab" x="88" y="236" text-anchor="middle">뒤좌</text>
-      <text id="trr" class="psi" x="132" y="220" text-anchor="middle">–</text><text class="lab" x="132" y="236" text-anchor="middle">뒤우</text>
-    </svg>
-  </div>
-
-  <!-- 열선 시트 (실내 top-down 실루엣) -->
-  <div class="card">
-    <div class="cardh">🔥 열선 시트 <span class="pill">탭 = ON/OFF</span></div>
-    <svg class="diagram" viewBox="0 0 220 290">
-      <defs><linearGradient id="heat" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#ff8a4c"/><stop offset="1" stop-color="#e82127"/></linearGradient></defs>
-      <rect x="30" y="16" width="160" height="258" rx="54" fill="#1a1c1f" stroke="#2c2f33" stroke-width="2"/>
-      <path d="M46 58 Q110 32 174 58" fill="none" stroke="#2c2f33" stroke-width="2"/>
-      <circle cx="70" cy="50" r="11" fill="none" stroke="#3a3f45" stroke-width="3"/>
-      <g class="seat" onclick="toggleSeat(0)"><rect id="sFL" x="48" y="72" width="46" height="58" rx="14" fill="#3a3f45"/></g>
-      <text class="lab" x="71" y="146" text-anchor="middle">운전석</text>
-      <g class="seat" onclick="toggleSeat(1)"><rect id="sFR" x="128" y="72" width="46" height="58" rx="14" fill="#3a3f45"/></g>
-      <text class="lab" x="151" y="146" text-anchor="middle">조수석</text>
-      <g class="seat" onclick="toggleSeat(2)"><rect id="sRL" x="44" y="186" width="40" height="56" rx="12" fill="#3a3f45"/></g>
-      <text class="lab" x="64" y="256" text-anchor="middle">뒤좌</text>
-      <g class="seat" onclick="toggleSeat(4)"><rect id="sRC" x="91" y="190" width="40" height="52" rx="12" fill="#3a3f45"/></g>
-      <text class="lab" x="111" y="256" text-anchor="middle">뒤중</text>
-      <g class="seat" onclick="toggleSeat(5)"><rect id="sRR" x="138" y="186" width="40" height="56" rx="12" fill="#3a3f45"/></g>
-      <text class="lab" x="158" y="256" text-anchor="middle">뒤우</text>
-    </svg>
-  </div>
-
-  <!-- 위치 -->
-  <div class="card">
-    <div class="cardh">📍 위치 <span id="locbadge" class="pill">–</span></div>
-    <iframe id="map" src="about:blank" loading="lazy"></iframe>
-    <div class="muted" id="loctxt" style="margin:8px 0 10px">위치 불러오는 중…</div>
-    <a class="btn" id="maplink" href="#" target="_blank"><button class="wide">🗺️ 지도 앱에서 열기</button></a>
-  </div>
-
-  <!-- 제어 -->
   <div class="sec">제어 (탭 = ON/OFF, 현재 상태 표시)</div>
   <div class="row">
     <button id="btnLock" onclick="tgl('lock')">잠금</button>
@@ -983,14 +1165,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button id="btnTrunk">트렁크</button>
   </div>
 
-  <div class="card">
-    <div class="slider">
-      <label>목표 온도 <b><span id="tempval">21</span>°C</b></label>
-      <input type="range" min="15" max="28" value="21" id="tempslider" oninput="tempval.textContent=this.value">
-      <button class="wide" style="margin-top:10px" onclick="setTemp()">온도 설정</button>
-    </div>
+  <div class="sec">기타</div>
+  <div class="row">
+    <button onclick="cmd('flash','라이트 깜빡')"><svg class="ic" viewBox="0 0 24 24"><path d="M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377"/></svg>라이트</button>
+    <button onclick="cmd('honk','경적')"><svg class="ic" viewBox="0 0 24 24"><path d="M21.184 10.073c-.45 0-.815.255-.815.569v.373h-.957c.019 0-.023-.01-.075 0h-8.31c-1.2 0-4.2-3.746-5.5-5.443a2.04 2.04 0 0 0-1.662-.8A1.9 1.9 0 0 0 2 6.677v10.856a1.693 1.693 0 0 0 1.693 1.693a2.26 2.26 0 0 0 1.875-.986c1.122-1.644 3.4-4.793 4.608-5.058a3.6 3.6 0 0 0-.2 1.289a3.153 3.153 0 0 0 2.8 3.42l4.3.046c.661.007 1.208-.576 1.7-1.059a3.12 3.12 0 0 0 .679-2.361a6.8 6.8 0 0 0-.4-1.76h1.313v.45c.026.315.412.556.862.538s.8-.287.771-.6v-2.5c-.001-.317-.367-.572-.817-.572m-5.171 6.068H13.18c-.449-.058-1.025.184-1.428-1.555a1.3 1.3 0 0 1 .012-.84c.061-.237.236-.875.714-.875H16.7c.69.046 1.151.909 1.151 1.738c.004 1.55-.998 1.522-1.838 1.532"/></svg>경적</button>
   </div>
-  <div class="card">
+
+  <div class="card" id="limitCard">
     <div class="slider">
       <label>충전 한도 <b><span id="limval">80</span>%</b></label>
       <input type="range" min="50" max="100" value="80" id="limslider" oninput="limval.textContent=this.value">
@@ -998,14 +1179,105 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <div class="sec">기타</div>
-  <div class="row">
-    <button onclick="cmd('flash','라이트 깜빡')"><svg class="ic" viewBox="0 0 24 24"><path d="M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377"/></svg>라이트</button>
-    <button onclick="cmd('honk','경적')"><svg class="ic" viewBox="0 0 24 24"><path d="M21.184 10.073c-.45 0-.815.255-.815.569v.373h-.957c.019 0-.023-.01-.075 0h-8.31c-1.2 0-4.2-3.746-5.5-5.443a2.04 2.04 0 0 0-1.662-.8A1.9 1.9 0 0 0 2 6.677v10.856a1.693 1.693 0 0 0 1.693 1.693a2.26 2.26 0 0 0 1.875-.986c1.122-1.644 3.4-4.793 4.608-5.058a3.6 3.6 0 0 0-.2 1.289a3.153 3.153 0 0 0 2.8 3.42l4.3.046c.661.007 1.208-.576 1.7-1.059a3.12 3.12 0 0 0 .679-2.361a6.8 6.8 0 0 0-.4-1.76h1.313v.45c.026.315.412.556.862.538s.8-.287.771-.6v-2.5c-.001-.317-.367-.572-.817-.572m-5.171 6.068H13.18c-.449-.058-1.025.184-1.428-1.555a1.3 1.3 0 0 1 .012-.84c.061-.237.236-.875.714-.875H16.7c.69.046 1.151.909 1.151 1.738c.004 1.55-.998 1.522-1.838 1.532"/></svg>경적</button>
+  <!-- 충전 상세 -->
+  <div class="card" id="chgcard">
+    <div class="cardh"><svg class="cih" viewBox="0 0 24 24"><path d="m17.635 9.991l-4.938-.1l-.064-7.01c.067-.958-.633-1.4-1.366.059l-5.629 9.53c-.648 1.046-.557 1.41.625 1.524h5l.131 6.573c-.017 1.41.574 2.16 1.438.432l5.686-9.735c.482-.728.282-1.251-.883-1.273"/></svg>충전 <span id="chgbadge" class="pill">–</span> <span id="chgloc" class="pill" style="margin-left:auto">–</span></div>
+    <div class="stats">
+      <div class="stat"><div class="k">충전 속도</div><div class="v"><span id="ckw">–</span> <small>kW</small> <span id="camp" style="color:var(--sub);font-size:13px"></span></div></div>
+      <div class="stat"><div class="k">완충까지</div><div class="v" style="font-size:16px"><span id="cfull">–</span></div></div>
+      <div class="stat"><div class="k" id="addedk">이번 충전</div><div class="v" style="font-size:16px"><span id="cthis">–</span></div></div>
+      <div class="stat"><div class="k" id="cmonthk">이번달 충전</div><div class="v" style="font-size:16px"><span id="cmonwon">–</span></div></div>
+    </div>
   </div>
 
+  <!-- 타이어 (가로형: 좌=앞, 우=뒤) -->
+  <div class="card" id="tireCard">
+    <div class="cardh">🛞 타이어 공기압 <span class="pill">PSI</span></div>
+    <svg class="diagram diagram-wide" viewBox="0 0 320 130">
+      <rect x="40" y="13" width="240" height="104" rx="34" fill="#33373c"/>
+      <rect id="wtfl" x="54" y="8"  width="54" height="26" rx="12" fill="#4a4f55"/>
+      <rect id="wtfr" x="54" y="96" width="54" height="26" rx="12" fill="#4a4f55"/>
+      <rect id="wtrl" x="212" y="8"  width="54" height="26" rx="12" fill="#4a4f55"/>
+      <rect id="wtrr" x="212" y="96" width="54" height="26" rx="12" fill="#4a4f55"/>
+      <text id="tfr" class="psi" x="81" y="19" text-anchor="middle">–</text><text class="lab" x="81" y="30" text-anchor="middle">앞우</text>
+      <text id="tfl" class="psi" x="81" y="107" text-anchor="middle">–</text><text class="lab" x="81" y="118" text-anchor="middle">앞좌</text>
+      <text id="trr" class="psi" x="239" y="19" text-anchor="middle">–</text><text class="lab" x="239" y="30" text-anchor="middle">뒤우</text>
+      <text id="trl" class="psi" x="239" y="107" text-anchor="middle">–</text><text class="lab" x="239" y="118" text-anchor="middle">뒤좌</text>
+    </svg>
+  </div>
+
+  <!-- 열선 시트 · 핸들 열선 (접기 가능) -->
+  <div class="card" id="heatCard">
+    <div class="cardh" style="cursor:pointer; user-select:none" onclick="toggleHeatCollapse()">
+      🔥 열선 시트 · 핸들
+      <span class="pill" id="heatBadge">탭 = ON/OFF</span>
+      <span id="heatChevron" style="margin-left:auto; font-size:16px; color:var(--sub); transition:transform .25s">▾</span>
+    </div>
+    <div id="heatBody">
+      <svg class="diagram" viewBox="0 0 220 290">
+        <defs>
+          <linearGradient id="heat" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#ff8a4c"/><stop offset="1" stop-color="#e82127"/>
+          </linearGradient>
+          <!-- 시트 열선 웨이브 (3줄, 세로) -->
+          <symbol id="heatWave" viewBox="-60 -60 120 120">
+            <g fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round">
+              <path d="M-22 -38 Q-38 -22 -22 0 T-22 38"/>
+              <path d="M0   -38 Q-16 -22 0   0 T0   38"/>
+              <path d="M22  -38 Q6   -22 22  0 T22  38"/>
+            </g>
+          </symbol>
+        </defs>
+        <rect x="30" y="16" width="160" height="258" rx="54" fill="#1a1c1f" stroke="#2c2f33" stroke-width="2"/>
+        <path d="M46 58 Q110 32 174 58" fill="none" stroke="#2c2f33" stroke-width="2"/>
+        <!-- 핸들 열선 (탭 = ON/OFF) — 아이콘 중앙정렬 -->
+        <g class="seat" onclick="toggleWheel()">
+          <circle id="sWheel" cx="70" cy="50" r="16" fill="#3a3f45" stroke="#5a5f65" stroke-width="2"/>
+          <circle cx="70" cy="50" r="7" fill="none" stroke="#20232a" stroke-width="2"/>
+          <use href="#heatWave" x="57" y="18" width="26" height="14" style="color:#8a8f96"/>
+        </g>
+        <!-- 시트 5개 — 각 좌석 정중앙에 열선 아이콘 -->
+        <g class="seat" onclick="toggleSeat(0)">
+          <rect id="sFL" x="48" y="72" width="46" height="58" rx="14" fill="#3a3f45"/>
+          <use href="#heatWave" x="56" y="86" width="30" height="30" style="color:#8a8f96" id="hFL"/>
+        </g>
+        <text class="lab" x="71" y="146" text-anchor="middle">운전석</text>
+        <g class="seat" onclick="toggleSeat(1)">
+          <rect id="sFR" x="128" y="72" width="46" height="58" rx="14" fill="#3a3f45"/>
+          <use href="#heatWave" x="136" y="86" width="30" height="30" style="color:#8a8f96" id="hFR"/>
+        </g>
+        <text class="lab" x="151" y="146" text-anchor="middle">조수석</text>
+        <g class="seat" onclick="toggleSeat(2)">
+          <rect id="sRL" x="44" y="186" width="40" height="56" rx="12" fill="#3a3f45"/>
+          <use href="#heatWave" x="51" y="201" width="26" height="26" style="color:#8a8f96" id="hRL"/>
+        </g>
+        <text class="lab" x="64" y="256" text-anchor="middle">뒤좌</text>
+        <g class="seat" onclick="toggleSeat(4)">
+          <rect id="sRC" x="91" y="190" width="40" height="52" rx="12" fill="#3a3f45"/>
+          <use href="#heatWave" x="98" y="203" width="26" height="26" style="color:#8a8f96" id="hRC"/>
+        </g>
+        <text class="lab" x="111" y="256" text-anchor="middle">뒤중</text>
+        <g class="seat" onclick="toggleSeat(5)">
+          <rect id="sRR" x="138" y="186" width="40" height="56" rx="12" fill="#3a3f45"/>
+          <use href="#heatWave" x="145" y="201" width="26" height="26" style="color:#8a8f96" id="hRR"/>
+        </g>
+        <text class="lab" x="158" y="256" text-anchor="middle">뒤우</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- 위치 -->
+  <div class="card">
+    <div class="cardh">📍 위치 <span id="locbadge" class="pill">–</span></div>
+    <iframe id="map" src="about:blank" loading="lazy"></iframe>
+    <div class="muted" id="loctxt" style="margin:8px 0 10px">위치 불러오는 중…</div>
+    <a class="btn" id="maplink" href="#" target="_blank"><button class="wide">🗺️ 지도 앱에서 열기</button></a>
+  </div>
+
+  <!-- 제어 -->
   <div id="vin" class="vintext"></div>
-  <a class="updlink" id="updlink" href="#">애플리케이션 업데이트</a>
+  <a class="updlink" id="updlink_app" href="#">대시보드 apk 업데이트</a>
+  <a class="updlink" id="updlink_watch" href="#">워치 apk 업데이트</a>
 
   <div id="modal">
     <div class="modalbox">
@@ -1022,7 +1294,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(function(){});
 const KEY = new URLSearchParams(location.search).get('key') || '';
-(function(){ var u=document.getElementById('updlink'); if(u) u.href='/app.apk?key='+encodeURIComponent(KEY); })();
+(function(){
+  var a=document.getElementById('updlink_app'); if(a) a.href='/app.apk?key='+encodeURIComponent(KEY);
+  var w=document.getElementById('updlink_watch'); if(w) w.href='/watch.apk?key='+encodeURIComponent(KEY);
+})();
 document.addEventListener('contextmenu', function(e){ e.preventDefault(); });   // 대시보드 전체 우클릭/롱프레스 메뉴 차단
 const MI=1.609344, PSI=14.5037738;
 const $=id=>document.getElementById(id);
@@ -1043,14 +1318,51 @@ async function cmd(action,label){
 async function setTemp(){ const c=$('tempslider').value; toast('온도 '+c+'° 설정…');
   try{ const r=await fetch(q('/api/set_temp?celsius='+c),{method:'POST'}); toast(r.ok?'✅ 온도 '+c+'°':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
 async function setLimit(){ const p=$('limslider').value; toast('충전한도 '+p+'% 설정…');
+  // 배터리 카드 노란 마커·목표% 즉시 연동
+  $('limmark').style.left=p+'%'; $('limtxt').textContent=p;
+  const eta=$('eta'); if(eta && eta.textContent) placeEta(+p);
   try{ const r=await fetch(q('/api/charge_limit?percent='+p),{method:'POST'}); toast(r.ok?'✅ 한도 '+p+'%':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
 
 function tire(id,wid,bar){ const el=$(id),w=$(wid); if(bar==null){el.textContent='–';return;} const p=Math.round(bar*PSI); el.textContent=p; const warn=p<33||p>44; el.classList.toggle('warn',warn); if(w) w.setAttribute('fill', warn?'#6b4a1f':'#4a4f55'); }
 
-const SEATMAP={0:{el:'sFL',f:'seat_heater_left',n:'운전석'},1:{el:'sFR',f:'seat_heater_right',n:'조수석'},2:{el:'sRL',f:'seat_heater_rear_left',n:'뒤좌'},4:{el:'sRC',f:'seat_heater_rear_center',n:'뒤중'},5:{el:'sRR',f:'seat_heater_rear_right',n:'뒤우'}};
+const SEATMAP={0:{el:'sFL',hi:'hFL',f:'seat_heater_left',n:'운전석'},1:{el:'sFR',hi:'hFR',f:'seat_heater_right',n:'조수석'},2:{el:'sRL',hi:'hRL',f:'seat_heater_rear_left',n:'뒤좌'},4:{el:'sRC',hi:'hRC',f:'seat_heater_rear_center',n:'뒤중'},5:{el:'sRR',hi:'hRR',f:'seat_heater_rear_right',n:'뒤우'}};
 let seatState={};
-function paintSeat(i,on){ const el=$(SEATMAP[i].el); if(el) el.setAttribute('fill', on?'url(#heat)':'#3a3f45'); }
-function updateSeats(cl){ for(const i in SEATMAP){ const v=cl[SEATMAP[i].f]; if(v!=null){ seatState[i]=v; paintSeat(i, v>0); } } }
+function paintSeat(i,on){
+  const el=$(SEATMAP[i].el); if(el) el.setAttribute('fill', on?'url(#heat)':'#3a3f45');
+  const hi=$(SEATMAP[i].hi); if(hi) hi.style.color = on ? '#ffffff' : '#8a8f96';
+}
+function updateSeats(cl){
+  for(const i in SEATMAP){ const v=cl[SEATMAP[i].f]; if(v!=null){ seatState[i]=v; paintSeat(i, v>0); } }
+  if(cl && 'steering_wheel_heater' in cl) paintWheel(!!cl.steering_wheel_heater);
+}
+let wheelOn=false;
+function paintWheel(on){
+  wheelOn=on;
+  const el=$('sWheel'); if(el) el.setAttribute('fill', on?'url(#heat)':'#3a3f45');
+}
+async function toggleWheel(){
+  const next=!wheelOn;
+  paintWheel(next);
+  toast('🔥 핸들 열선 ' + (next?'켜는 중…':'끄는 중…'));
+  try{
+    const r=await fetch(q('/api/steering?on='+next), {method:'POST'});
+    const j=await r.json().catch(()=>({}));
+    if(j.response && j.response.result===false){ toast('❌ 핸들 열선: '+(j.response.reason||'실패')); paintWheel(!next); }
+    else toast('🔥 핸들 열선 ' + (next?'ON':'OFF'));
+  }catch(e){ toast('❌ 연결 실패'); paintWheel(!next); }
+}
+function applyHeatCollapse(){
+  const collapsed = localStorage.getItem('heatCollapsed') === '1';
+  const body=$('heatBody'), chev=$('heatChevron');
+  if(body) body.style.display = collapsed ? 'none' : '';
+  if(chev) chev.style.transform = collapsed ? 'rotate(-90deg)' : '';
+}
+function toggleHeatCollapse(){
+  const cur = localStorage.getItem('heatCollapsed') === '1';
+  localStorage.setItem('heatCollapsed', cur?'0':'1');
+  applyHeatCollapse();
+}
+applyHeatCollapse();
 async function toggleSeat(i){
   const on=(seatState[i]||0)>0, lvl=on?0:3;
   paintSeat(i,!on); seatState[i]=lvl; toast('🔥 '+SEATMAP[i].n+(lvl>0?' 켜는 중…':' 끄는 중…'));
@@ -1097,6 +1409,40 @@ function tgl(kind){
 }
 async function wake(){ toast('☀️ 깨우는 중…'); try{ await fetch(q('/api/command/wake'),{method:'POST'}); toast('☀️ 깨우기 전송'); setTimeout(refresh,4000); setTimeout(refresh,10000); }catch(e){ toast('❌ 연결 실패'); } }
 
+// eta 라벨을 마커(pct%) 중앙에 두되, 게이지바 좌우 끝을 넘지 않게 clamp
+function placeEta(pct){
+  const eta=$('eta'); if(!eta) return;
+  const W=eta.parentNode.clientWidth, w=eta.offsetWidth;
+  let x = W*pct/100 - w/2;
+  x = Math.max(0, Math.min(W - w, x));
+  eta.style.left = x+'px';
+  eta.style.transform = 'none';
+}
+
+// 완충까지 남은 분(m) → "오늘 10:30" / "내일 23:50" / "7/26 08:00"
+function etaLabel(mins){
+  const t=new Date(Date.now()+mins*60000);
+  const hh=String(t.getHours()).padStart(2,'0'), mm=String(t.getMinutes()).padStart(2,'0');
+  const now=new Date();
+  const d0=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  const d1=new Date(t.getFullYear(),t.getMonth(),t.getDate());
+  const days=Math.round((d1-d0)/86400000);
+  let day = days<=0?'오늘' : days===1?'내일' : days===2?'모레' : (t.getMonth()+1)+'/'+t.getDate();
+  return day+' '+hh+':'+mm;
+}
+
+// 충전 중이면 충전한도·충전 카드를 목표온도 위로, 아니면 타이어 앞(원위치)으로
+function reorderCharging(charging){
+  const limit=$('limitCard'), chg=$('chgcard'), temp=$('tempCard'), tire=$('tireCard');
+  if(!limit||!chg||!temp||!tire) return;
+  const p=limit.parentNode;
+  if(charging){
+    if(temp.previousElementSibling!==chg){ p.insertBefore(limit, temp); p.insertBefore(chg, temp); }
+  } else {
+    if(tire.previousElementSibling!==chg){ p.insertBefore(limit, tire); p.insertBefore(chg, tire); }
+  }
+}
+
 async function refresh(){
   $('updated').textContent='불러오는 중…';
   try{
@@ -1107,7 +1453,7 @@ async function refresh(){
     const cs=d.charge_state||{}, cl=d.climate_state||{}, vs=d.vehicle_state||{}, ds=d.drive_state||{};
     if(d.vin){ const ve=$('vin'); ve.textContent='VIN  '+d.vin; ve.setAttribute('data-vin',d.vin); }
     // 배터리/주행
-    if(cs.battery_level!=null){ $('soc').textContent=cs.battery_level; $('socbar').style.width=cs.battery_level+'%'; }
+    if(cs.battery_level!=null){ $('soc').textContent=cs.battery_level; $('socbar').style.width=cs.battery_level+'%'; const sp=$('chgspark'); if(sp) sp.style.left=cs.battery_level+'%'; }
     if(cs.battery_range!=null) $('range').textContent=Math.round(cs.battery_range*MI);
     if(cs.charge_limit_soc!=null){ $('limtxt').textContent=cs.charge_limit_soc; $('limmark').style.left=cs.charge_limit_soc+'%'; $('limslider').value=cs.charge_limit_soc; $('limval').textContent=cs.charge_limit_soc; }
     if(vs.odometer!=null) $('odo').textContent=Math.round(vs.odometer*MI).toLocaleString();
@@ -1123,11 +1469,35 @@ async function refresh(){
     $('chgbadge').className = 'pill'+(charging?' on':'');
     $('chgstate').textContent = charging?('충전중 '+(cs.charger_power||0)+'kW'):(cs.charging_state==='Complete'?'충전 완료':'미충전');
     $('ckw').textContent = cs.charger_power!=null?cs.charger_power:'–';
-    $('ctarget').textContent = cs.charge_limit_soc!=null?cs.charge_limit_soc:'–';
-    $('cadded').textContent = cs.charge_energy_added!=null?cs.charge_energy_added.toFixed(1):'–';
-    $('addedk').textContent = charging?'이번 충전 추가':'마지막 충전 추가';
+    // 암페어 (충전 중일 때만)
+    const amp = cs.charger_actual_current;
+    $('camp').textContent = (charging && amp!=null) ? ('· '+amp+'A') : '';
+    $('addedk').textContent = charging?'이번 충전':'마지막 충전';
     const m=cs.minutes_to_full_charge!=null?cs.minutes_to_full_charge:(cs.time_to_full_charge?cs.time_to_full_charge*60:0);
     $('cfull').textContent = (charging&&m>0)?(Math.floor(m/60)+'시간 '+Math.round(m%60)+'분'):'–';
+    // 완충 예상 시각 — 노란 한도 마커 아래 중앙 (카드 밖으로 안 나가게 clamp)
+    const eta=$('eta');
+    if(eta){
+      const lim=cs.charge_limit_soc;
+      if(charging && m>0 && lim!=null){
+        eta.textContent = '('+etaLabel(m)+' 완료)';
+        placeEta(lim);
+      } else { eta.textContent=''; }
+    }
+    // 충전 요금 (서버 계산)
+    const cc = j.charge_cost;
+    const kwh = cs.charge_energy_added!=null?cs.charge_energy_added.toFixed(1):'–';
+    if(cc){
+      $('chgloc').textContent = cc.location || '–';
+      $('cthis').textContent = kwh + 'kWh / ' + (cc.session_won||0).toLocaleString() + '원';
+      $('cmonwon').textContent = (cc.month_kwh||0) + 'kWh / ' + (cc.month_won||0).toLocaleString() + '원';
+    } else {
+      $('cthis').textContent = kwh + 'kWh';
+    }
+    // 배터리 게이지 충전 애니메이션 + 카드 재배치
+    const bar=$('socbar').parentNode;
+    if(bar) bar.classList.toggle('charging', charging);
+    reorderCharging(charging);
     // 타이어
     tire('tfl','wtfl',vs.tpms_pressure_fl); tire('tfr','wtfr',vs.tpms_pressure_fr); tire('trl','wtrl',vs.tpms_pressure_rl); tire('trr','wtrr',vs.tpms_pressure_rr);
     updateSeats(cl);

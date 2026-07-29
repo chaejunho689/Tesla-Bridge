@@ -55,6 +55,14 @@ services:
       - ./certs:/certs:ro
     depends_on:
       - tesla-proxy
+    networks:
+      - default
+      - teslamate   # TeslaMate Postgres(charging_processes) 조회용
+
+networks:
+  teslamate:
+    external: true
+    name: teslamate_default
 
 volumes:
   caddy-data:
