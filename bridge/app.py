@@ -447,6 +447,61 @@ async def sentry(request: Request, vin: str = Query(""), on: bool = Query(True))
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
+# ── 폰 알림 원격 테스트 (adb 불필요) ────────────────────────────
+_notify_queue: list[str] = []
+
+@app.get("/api/notify_test")
+async def notify_test(request: Request, which: str = Query(...)):
+    require_bridge_auth(request)
+    _notify_queue.append(which)
+    return JSONResponse({"ok": True, "queued": which})
+
+@app.get("/api/notify_pending")
+async def notify_pending(request: Request):
+    require_bridge_auth(request)
+    items = _notify_queue[:]
+    _notify_queue.clear()
+    return JSONResponse({"which": items})
+
+@app.get("/notifytest")
+async def notifytest_page(key: str = Query("")):
+    return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>알림 테스트</title><style>
+body{margin:0;background:#0e0f11;color:#eee;font-family:-apple-system,Roboto,sans-serif;padding:16px}
+h2{font-size:18px;margin:8px 0 4px} .muted{color:#8a8f96;font-size:12px;margin-bottom:14px}
+.sec{color:#8a8f96;font-size:13px;margin:16px 0 8px}
+button{display:block;width:100%;padding:16px;margin:8px 0;border:0;border-radius:12px;
+  background:#1e1f22;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+button:active{background:#2a2c30}
+#t{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#e82127;color:#fff;
+  padding:10px 18px;border-radius:20px;opacity:0;transition:opacity .2s;font-size:14px}
+#t.on{opacity:1}
+</style></head><body>
+<h2>🔔 폰 알림 테스트</h2>
+<div class="muted">버튼을 누르면 폰 앱이 최대 10초 안에 해당 알림을 띄웁니다.</div>
+<div class="sec">이벤트 알림</div>
+<button onclick="s('sw')">신규 소프트웨어</button>
+<button onclick="s('trunk')">트렁크 열림</button>
+<button onclick="s('frunk')">프렁크 열림</button>
+<button onclick="s('chgdone')">충전 완료 (시간·요금)</button>
+<div class="sec">나우바 / 상시 알림</div>
+<button onclick="s('drive')">운전 중</button>
+<button onclick="s('charge')">충전 중 (완충까지)</button>
+<button onclick="s('hvac')">에어컨 가동 중</button>
+<button onclick="s('hvacdone')">에어컨 완료</button>
+<button onclick="s('sentry')">센트리모드 켜짐</button>
+<button onclick="s('park')">주차 됨</button>
+<div id="t"></div>
+<script>
+const KEY=new URLSearchParams(location.search).get('key')||'';
+async function s(w){ try{ await fetch('/api/notify_test?which='+w+'&key='+encodeURIComponent(KEY));
+  toast('전송됨: '+w); }catch(e){ toast('실패'); } }
+let tt; function toast(m){ const t=document.getElementById('t'); t.textContent=m; t.classList.add('on');
+  clearTimeout(tt); tt=setTimeout(()=>t.classList.remove('on'),1500); }
+</script></body></html>""")
+
+
 # ── 충전 요금 관리 (Claude가 등록/수정) ────────────────────────────
 @app.get("/api/charge/info")
 async def charge_info(request: Request):
@@ -497,6 +552,134 @@ async def charge_rate(request: Request, name: str = Query(...),
     _save_rates(d)
     return JSONResponse({"ok": True, "rates": loc["rates"]})
 
+
+# ══════════ 분석용 시계열 API ══════════
+@app.get("/api/analytics/battery")
+async def analytics_battery(request: Request, mode: str = Query("hour")):
+    """배터리% 시계열. mode=hour(24시간, 매 시간) / day(30일, 매 일). 빈 버킷은 직전값 유지."""
+    require_bridge_auth(request)
+    if mode == "day":
+        rows = await _tm_fetch(
+            """WITH days AS (
+                 SELECT generate_series(
+                   (date_trunc('day', now() + interval '9 hours') - interval '29 days')::timestamp,
+                   (date_trunc('day', now() + interval '9 hours'))::timestamp,
+                   interval '1 day') AS bucket)
+               SELECT d.bucket,
+                      round(avg(p.battery_level)::numeric, 1) AS pct
+                 FROM days d
+                 LEFT JOIN positions p
+                   ON date_trunc('day', p.date + interval '9 hours') = d.bucket
+                  AND p.car_id = $1 AND p.battery_level IS NOT NULL
+                GROUP BY d.bucket ORDER BY d.bucket""", TM_CAR_ID)
+    else:
+        # 시간별: 최근 14일, 각 시간의 '마지막' 배터리값(그 시간 내 여러 번 변해도 끝값)
+        rows = await _tm_fetch(
+            """SELECT DISTINCT ON (date_trunc('hour', date + interval '9 hours'))
+                      date_trunc('hour', date + interval '9 hours') AS bucket,
+                      battery_level AS pct
+                 FROM positions
+                WHERE car_id = $1 AND battery_level IS NOT NULL
+                  AND date >= now() - interval '14 days'
+                ORDER BY date_trunc('hour', date + interval '9 hours'), date DESC""",
+            TM_CAR_ID)
+
+    if mode == "day":
+        # 빈 날은 직전 값 유지, 첫 실측 전 구간 제거
+        filled = []
+        last = None
+        for r in rows:
+            v = float(r["pct"]) if r["pct"] is not None else last
+            if v is not None: last = v
+            filled.append({"t": str(r["bucket"]), "v": v})
+        series = [p for p in filled if p["v"] is not None]
+    else:
+        # 데이터 있는 시간만, 값이 '변한 시점'만 남김 (연속 동일값 collapse)
+        series = []
+        for r in rows:
+            v = float(r["pct"])
+            if not series or series[-1]["v"] != v:
+                series.append({"t": str(r["bucket"]), "v": v})
+    return JSONResponse({"mode": mode, "series": series})
+
+
+@app.get("/api/analytics/home_charge")
+async def analytics_home_charge(request: Request):
+    """집 충전비 월별 (9~8일 사이클, 이번 사이클은 오늘까지). 사용자 지정 override 반영."""
+    require_bridge_auth(request)
+    home = _get_location("집")
+    cd = home.get("cycle_day", 9) if home else 9
+    rows = await _tm_fetch(
+        """SELECT (cp.start_date + interval '9 hours')::date AS kst_date,
+                  cp.charge_energy_added AS kwh
+             FROM charging_processes cp
+             LEFT JOIN geofences g ON g.id = cp.geofence_id
+            WHERE cp.car_id = $1 AND cp.charge_energy_added > 0 AND g.name = '집'
+            ORDER BY cp.start_date""", TM_CAR_ID)
+    # 각 세션을 청구 사이클(cycle_day 기준 월)로 매핑
+    from collections import defaultdict
+    def cycle_label(d: date):
+        if d.day >= cd:
+            m0 = d.replace(day=cd)
+        else:
+            first = d.replace(day=1)
+            m0 = (first - timedelta(days=1)).replace(day=cd)
+        return m0.strftime("%Y-%m")   # 사이클 시작 월 (예 7/9~8/8 = 2026-07)
+    agg = defaultdict(lambda: {"kwh": 0.0})
+    for r in rows:
+        lbl = cycle_label(r["kst_date"])
+        agg[lbl]["kwh"] += float(r["kwh"] or 0)
+    # 사용자 지정 override
+    OVERRIDE = {
+        "2026-02": {"kwh": 170.9,  "cost": 48831},
+        "2026-05": {"kwh": 62.524, "cost": 16496},
+        "2026-06": {"kwh": 125.718, "cost": 33963},
+        "2026-07": {"kwh": 90.614, "cost": 25726},
+    }
+    # 3~4월: 사용자 미기록 → 평균 요금/kWh로 계산
+    known_rates = [16496/62.524, 33963/125.718, 25726/90.614, 48831/170.9]
+    avg_rate = sum(known_rates)/len(known_rates)  # ~271
+    series = []
+    for lbl in sorted(agg.keys()):
+        if lbl in OVERRIDE:
+            series.append({"month": lbl, "kwh": OVERRIDE[lbl]["kwh"], "cost": OVERRIDE[lbl]["cost"]})
+        else:
+            kwh = round(agg[lbl]["kwh"], 3)
+            series.append({"month": lbl, "kwh": kwh, "cost": int(round(kwh * avg_rate))})
+    # OVERRIDE에 있는데 TeslaMate엔 없는 달도 표시
+    for lbl, v in OVERRIDE.items():
+        if lbl not in agg:
+            series.append({"month": lbl, "kwh": v["kwh"], "cost": v["cost"]})
+    series.sort(key=lambda x: x["month"])
+    return JSONResponse({"cycle_day": cd, "series": series,
+                         "note": "매월 %d일~다음달 %d일 사이클" % (cd, cd-1)})
+
+
+@app.get("/api/analytics/distance")
+async def analytics_distance(request: Request, mode: str = Query("day")):
+    """주행거리 시계열. mode=day(30일) / week(12주) / month(12개월)"""
+    require_bridge_auth(request)
+    if mode == "week":
+        sql = """SELECT date_trunc('week', start_date + interval '9 hours') AS bucket,
+                        sum(distance) AS km
+                   FROM drives WHERE car_id=$1 AND distance IS NOT NULL
+                    AND start_date >= now() - interval '84 days'
+                  GROUP BY 1 ORDER BY 1"""
+    elif mode == "month":
+        sql = """SELECT date_trunc('month', start_date + interval '9 hours') AS bucket,
+                        sum(distance) AS km
+                   FROM drives WHERE car_id=$1 AND distance IS NOT NULL
+                    AND start_date >= now() - interval '12 months'
+                  GROUP BY 1 ORDER BY 1"""
+    else:  # day
+        sql = """SELECT date_trunc('day', start_date + interval '9 hours') AS bucket,
+                        sum(distance) AS km
+                   FROM drives WHERE car_id=$1 AND distance IS NOT NULL
+                    AND start_date >= now() - interval '30 days'
+                  GROUP BY 1 ORDER BY 1"""
+    rows = await _tm_fetch(sql, TM_CAR_ID)
+    return JSONResponse({"mode": mode,
+        "series": [{"t": str(r["bucket"]), "v": round(float(r["km"] or 0), 1)} for r in rows]})
 
 
 def _safe_json(r: httpx.Response):
@@ -780,6 +963,23 @@ async def _compute_charge_cost(cs, ds):
             "cycle": f"{cstart.isoformat()}~{cend.isoformat()}"}
 
 
+async def _vehicle_online(vin) -> str:
+    """차량 요약 엔드포인트로 상태만 조회 (online/asleep/offline) — 차를 깨우지 않음."""
+    try:
+        at = await get_access_token()
+        url = f"{FLEET_BASE}/api/1/vehicles/{vin}"
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers={"Authorization": f"Bearer {at}"})
+        if r.status_code == 200:
+            d = _safe_json(r)
+            resp = d.get("response") if isinstance(d, dict) else None
+            if isinstance(resp, dict):
+                return resp.get("state", "")
+    except Exception:
+        pass
+    return ""
+
+
 async def _fetch_and_cache(vin):
     at = await get_access_token()
     base = "charge_state;climate_state;drive_state;vehicle_state;gui_settings;vehicle_config"
@@ -969,13 +1169,8 @@ async def _sync_loop():
     await asyncio.sleep(5)
     while True:
         try:
-            # 5분마다 차량 데이터 자동 갱신 (자면 실패 → 캐시 유지)
-            if time.time() - _last_fetch > 300:
-                _last_fetch = time.time()
-                try:
-                    await _fetch_and_cache(DEFAULT_VIN)
-                except Exception:
-                    pass
+            # 자동 vehicle_data 폴링 제거: TeslaMate가 이미 폴링/수면관리 중이므로
+            # 브릿지가 추가로 차를 건드리면 잠들기를 방해함. 캐시는 앱(온디맨드)·명령 후에만 갱신.
             await _sync_once()
         except Exception:
             pass
@@ -1018,17 +1213,28 @@ DASHBOARD_HTML = r"""<!doctype html>
   .stat .v small { font-size:12px; color:var(--sub); font-weight:400; }
   .bigsoc { font-size:44px; font-weight:700; line-height:1; }
   .bigsoc small { font-size:18px; color:var(--sub); font-weight:500; }
-  .bar { height:10px; background:var(--card2); border-radius:6px; overflow:hidden; margin:14px 0 6px; position:relative; }
+  .barwrap { position:relative; margin:14px 0 6px; }
+  .bar { height:10px; background:var(--card2); border-radius:6px; overflow:hidden; margin:0; position:relative; }
   .bar > i { display:block; height:100%; background:linear-gradient(90deg,#2ecc71,#27ae60); width:0%; transition:width .5s; }
-  .bar > .lim { position:absolute; top:-3px; width:2px; height:16px; background:var(--amber); }
-  /* 충전 중: 회색(빈) 구간의 100%지점 → 현재잔량 경계까지 흰 세로선이 우→좌로 가속 이동 */
+  /* 충전 중: 회색(빈) 구간의 100%지점 → 현재잔량 경계까지 초록 세로선이 우→좌로 이동 (패스 사이 정지 간격) */
   #chgspark { position:absolute; top:0; bottom:0; right:0; left:0; display:none; pointer-events:none; }
   .bar.charging > #chgspark { display:block; }
   #chgspark::before {
     content:''; position:absolute; top:0; bottom:0; width:3px; background:#2ecc71;
-    animation:chgspark .7s cubic-bezier(.55,0,.9,.45) infinite;
+    animation:chgspark 2.2s linear infinite;
   }
-  @keyframes chgspark { from{ left:100%; } to{ left:0%; } }
+  @keyframes chgspark {
+    0%   { left:100%; opacity:1; animation-timing-function: cubic-bezier(.6,0,.95,.25); }
+    55%  { left:0%;   opacity:1; }
+    56%  { opacity:0; }
+    100% { left:0%;   opacity:0; }
+  }
+  /* 충전한도 드래그 노브 (충전기 연결 시에만) */
+  #limknob { position:absolute; top:5px; left:80%; transform:translate(-50%,-50%);
+    width:20px; height:20px; border-radius:50%; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.5);
+    display:none; cursor:grab; touch-action:none; z-index:3; }
+  #limknob.on { display:block; }
+  #limknob:active { cursor:grabbing; }
   .barfoot { position:relative; color:var(--sub); font-size:12px; min-height:16px; }
   .eta { position:absolute; top:0; transform:translateX(-50%); white-space:nowrap; color:#f5c518; font-weight:600; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
@@ -1064,7 +1270,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   #tempslider { accent-color:var(--blu); }
   #limslider  { accent-color:var(--grn); }
   .updlink { display:block; text-align:right; color:var(--sub); font-size:11px; margin:20px 4px 8px; text-decoration:none; opacity:.7; }
-  .vintext { text-align:left; color:var(--sub); font-size:10px; opacity:.5; letter-spacing:.3px; margin:20px 4px 0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  .vintext { text-align:left; color:var(--sub); font-size:10px; opacity:.5; letter-spacing:.3px; margin:5px 4px 0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  .odotext { text-align:left; color:var(--sub); font-size:13px; opacity:.5; letter-spacing:.3px; margin:20px 4px 0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  .tabbtn { padding:4px 10px; font-size:12px; border-radius:14px; background:var(--card2); color:var(--sub); border:0; cursor:pointer; }
+  .tabbtn.active { background:var(--red); color:#fff; }
+  .scrollx { overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; }
+  .scrollx canvas { display:block; height:180px; }
   /* 모던 확인 모달 */
   #modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
   #modal.on { display:flex; animation:fade .15s ease; }
@@ -1117,9 +1328,12 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div style="color:var(--sub); font-size:13px; margin-top:2px" id="chgstate">–</div>
       </div>
     </div>
-    <div class="bar"><i id="socbar"></i><b id="chgspark"></b><span class="lim" id="limmark"></span></div>
+    <div class="barwrap">
+      <div class="bar"><i id="socbar"></i><b id="chgspark"></b></div>
+      <div id="limknob"></div>
+    </div>
     <div class="barfoot">
-      <span>목표 <span id="limtxt">–</span>%</span>
+      <span id="limlabel" style="display:none">목표 <span id="limtxt">–</span>%</span>
       <span id="eta" class="eta"></span>
     </div>
     <span id="updated" style="display:none"></span>
@@ -1143,13 +1357,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- 주행거리 / 상태 -->
-  <div class="card">
-    <div class="stats">
-      <div class="stat"><div class="k">총 주행거리</div><div class="v"><span id="odo">–</span> <small>km</small></div></div>
-      <div class="stat"><div class="k">상태</div><div class="v" style="font-size:16px"><span id="state">–</span></div></div>
-    </div>
-  </div>
 
   <div class="sec">제어 (탭 = ON/OFF, 현재 상태 표시)</div>
   <div class="row">
@@ -1169,14 +1376,6 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="row">
     <button onclick="cmd('flash','라이트 깜빡')"><svg class="ic" viewBox="0 0 24 24"><path d="M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377"/></svg>라이트</button>
     <button onclick="cmd('honk','경적')"><svg class="ic" viewBox="0 0 24 24"><path d="M21.184 10.073c-.45 0-.815.255-.815.569v.373h-.957c.019 0-.023-.01-.075 0h-8.31c-1.2 0-4.2-3.746-5.5-5.443a2.04 2.04 0 0 0-1.662-.8A1.9 1.9 0 0 0 2 6.677v10.856a1.693 1.693 0 0 0 1.693 1.693a2.26 2.26 0 0 0 1.875-.986c1.122-1.644 3.4-4.793 4.608-5.058a3.6 3.6 0 0 0-.2 1.289a3.153 3.153 0 0 0 2.8 3.42l4.3.046c.661.007 1.208-.576 1.7-1.059a3.12 3.12 0 0 0 .679-2.361a6.8 6.8 0 0 0-.4-1.76h1.313v.45c.026.315.412.556.862.538s.8-.287.771-.6v-2.5c-.001-.317-.367-.572-.817-.572m-5.171 6.068H13.18c-.449-.058-1.025.184-1.428-1.555a1.3 1.3 0 0 1 .012-.84c.061-.237.236-.875.714-.875H16.7c.69.046 1.151.909 1.151 1.738c.004 1.55-.998 1.522-1.838 1.532"/></svg>경적</button>
-  </div>
-
-  <div class="card" id="limitCard">
-    <div class="slider">
-      <label>충전 한도 <b><span id="limval">80</span>%</b></label>
-      <input type="range" min="50" max="100" value="80" id="limslider" oninput="limval.textContent=this.value">
-      <button class="wide" style="margin-top:10px" onclick="setLimit()">한도 설정</button>
-    </div>
   </div>
 
   <!-- 충전 상세 -->
@@ -1274,10 +1473,41 @@ DASHBOARD_HTML = r"""<!doctype html>
     <a class="btn" id="maplink" href="#" target="_blank"><button class="wide">🗺️ 지도 앱에서 열기</button></a>
   </div>
 
+  <!-- 배터리 시계열 -->
+  <div class="card">
+    <div class="cardh">📈 배터리 <span class="pill" id="battRangeLbl">시간별</span>
+      <span style="margin-left:auto; display:flex; gap:6px">
+        <button class="tabbtn active" id="tabBattHour" onclick="loadBatt('hour')">시간</button>
+        <button class="tabbtn" id="tabBattDay" onclick="loadBatt('day')">일</button>
+      </span>
+    </div>
+    <div class="scrollx"><canvas id="cBatt" height="180"></canvas></div>
+  </div>
+
+  <!-- 집 월 충전비 -->
+  <div class="card">
+    <div class="cardh">🏠 월별 집 충전비 <span class="pill">9~8일 사이클</span></div>
+    <div class="scrollx"><canvas id="cHome" height="180"></canvas></div>
+  </div>
+
+  <!-- 주행거리 -->
+  <div class="card">
+    <div class="cardh">🚗 주행거리
+      <span style="margin-left:auto; display:flex; gap:6px">
+        <button class="tabbtn active" id="tabDistDay" onclick="loadDist('day')">일</button>
+        <button class="tabbtn" id="tabDistWeek" onclick="loadDist('week')">주</button>
+        <button class="tabbtn" id="tabDistMonth" onclick="loadDist('month')">월</button>
+      </span>
+    </div>
+    <div class="scrollx"><canvas id="cDist" height="180"></canvas></div>
+  </div>
+
   <!-- 제어 -->
+  <div class="odotext">총 주행거리 <span id="odo">–</span> km</div>
   <div id="vin" class="vintext"></div>
   <a class="updlink" id="updlink_app" href="#">대시보드 apk 업데이트</a>
   <a class="updlink" id="updlink_watch" href="#">워치 apk 업데이트</a>
+  <a class="updlink" id="updlink_notify" href="#">알림 테스트</a>
 
   <div id="modal">
     <div class="modalbox">
@@ -1297,6 +1527,7 @@ const KEY = new URLSearchParams(location.search).get('key') || '';
 (function(){
   var a=document.getElementById('updlink_app'); if(a) a.href='/app.apk?key='+encodeURIComponent(KEY);
   var w=document.getElementById('updlink_watch'); if(w) w.href='/watch.apk?key='+encodeURIComponent(KEY);
+  var nt=document.getElementById('updlink_notify'); if(nt) nt.href='/notifytest?key='+encodeURIComponent(KEY);
 })();
 document.addEventListener('contextmenu', function(e){ e.preventDefault(); });   // 대시보드 전체 우클릭/롱프레스 메뉴 차단
 const MI=1.609344, PSI=14.5037738;
@@ -1317,12 +1548,6 @@ async function cmd(action,label){
 }
 async function setTemp(){ const c=$('tempslider').value; toast('온도 '+c+'° 설정…');
   try{ const r=await fetch(q('/api/set_temp?celsius='+c),{method:'POST'}); toast(r.ok?'✅ 온도 '+c+'°':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
-async function setLimit(){ const p=$('limslider').value; toast('충전한도 '+p+'% 설정…');
-  // 배터리 카드 노란 마커·목표% 즉시 연동
-  $('limmark').style.left=p+'%'; $('limtxt').textContent=p;
-  const eta=$('eta'); if(eta && eta.textContent) placeEta(+p);
-  try{ const r=await fetch(q('/api/charge_limit?percent='+p),{method:'POST'}); toast(r.ok?'✅ 한도 '+p+'%':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
-
 function tire(id,wid,bar){ const el=$(id),w=$(wid); if(bar==null){el.textContent='–';return;} const p=Math.round(bar*PSI); el.textContent=p; const warn=p<33||p>44; el.classList.toggle('warn',warn); if(w) w.setAttribute('fill', warn?'#6b4a1f':'#4a4f55'); }
 
 const SEATMAP={0:{el:'sFL',hi:'hFL',f:'seat_heater_left',n:'운전석'},1:{el:'sFR',hi:'hFR',f:'seat_heater_right',n:'조수석'},2:{el:'sRL',hi:'hRL',f:'seat_heater_rear_left',n:'뒤좌'},4:{el:'sRC',hi:'hRC',f:'seat_heater_rear_center',n:'뒤중'},5:{el:'sRR',hi:'hRR',f:'seat_heater_rear_right',n:'뒤우'}};
@@ -1378,6 +1603,8 @@ async function act(path,label){ toast(label+' 전송…');
   }catch(e){ toast('❌ 연결 실패'); } }
 const IC={
   lock:'M17.744 8.667v-.953a5.744 5.744 0 0 0-11.488 0v.953a1.915 1.915 0 0 0-1.915 1.9V20.1A1.915 1.915 0 0 0 6.256 22h11.488a1.915 1.915 0 0 0 1.915-1.9v-9.529a1.915 1.915 0 0 0-1.915-1.904m-1.914 0H8.17v-.953A3.74 3.74 0 0 1 12 3.905a3.74 3.74 0 0 1 3.83 3.809Z',
+  lockClosed:'M12 2a5 5 0 0 0-5 5v3h-.4c-.88 0-1.6.72-1.6 1.6v7C5 19.92 6.08 21 7.4 21h9.2c1.32 0 2.4-1.08 2.4-2.4v-7c0-.88-.72-1.6-1.6-1.6H17V7a5 5 0 0 0-5-5m3 8V7c0-1.658-1.342-3-3-3S9 5.342 9 7v3z',
+  lockOpen:'M18 2a5 5 0 0 0-5 5v3H4.6c-.88 0-1.6.72-1.6 1.6v7C3 19.92 4.08 21 5.4 21h9.2c1.32 0 2.4-1.08 2.4-2.4v-7c0-.88-.72-1.6-1.6-1.6H15V7c0-1.658 1.342-3 3-3s3 1.342 3 3v3a1 1 0 1 0 2 0V7a5 5 0 0 0-5-5',
   open:'m17.635 9.991l-4.938-.1l-.064-7.01c.067-.958-.633-1.4-1.366.059l-5.629 9.53c-.648 1.046-.557 1.41.625 1.524h5l.131 6.573c-.017 1.41.574 2.16 1.438.432l5.686-9.735c.482-.728.282-1.251-.883-1.273',
   fan:'M13.658 12.2a1.01 1.01 0 0 0-1.252.978V21a1.01 1.01 0 0 0 1.252.978a5.01 5.01 0 0 0 4.067-4.891a5.16 5.16 0 0 0-4.067-4.887m-3.424-.4a1.008 1.008 0 0 0 1.251-.978V3a1.01 1.01 0 0 0-1.251-.978a5.16 5.16 0 0 0-4.067 4.89a5.01 5.01 0 0 0 4.067 4.888m11.712-1.445a5.16 5.16 0 0 0-4.891-4.067a5.01 5.01 0 0 0-4.891 4.067a1.008 1.008 0 0 0 .978 1.251h7.826a1.01 1.01 0 0 0 .978-1.251m-11.162 2.099H2.959a1.012 1.012 0 0 0-.979 1.252a5.164 5.164 0 0 0 4.892 4.067a5.01 5.01 0 0 0 4.891-4.067a1.01 1.01 0 0 0-.979-1.252',
   flash:'M15.911 5.852h-1.953A1.644 1.644 0 0 0 12.314 7.5v9.438a1.5 1.5 0 0 0 1.5 1.5H15.5a6.5 6.5 0 0 0 6.5-6.5a6.09 6.09 0 0 0-6.089-6.086M2.814 17.931a.692.692 0 1 0 .162 1.374l8.142-.946l-.145-1.372zM2.721 6.069l8.158.944l.145-1.372L2.882 4.7a.692.692 0 1 0-.161 1.374Zm0 8.848l7.956-.316v-1.38l-8.011.319a.689.689 0 1 0 .055 1.377m-.055-4.48l8.011.319v-1.38L2.721 9.06a.689.689 0 1 0-.055 1.377',
@@ -1385,11 +1612,12 @@ const IC={
   hood:'m19.99 16.3l-4.6-.021c0-.044.006-.086.006-.131a5.017 5.017 0 1 0-10.033 0v.085L3.9 16.227v-3.083a1.36 1.36 0 0 1 1.066-1.33l3.021-.965a15 15 0 0 1 4.233-.709l3-.068a4.9 4.9 0 0 0 2.046-.366l3.851-1.917c.7-.371 1.128-.816.757-1.514c-.275-.516-1.468-.224-1.985.051L16.467 7.7c-.168.09-.339.164-.488.227a16 16 0 0 0-5.109-3.761A14.36 14.36 0 0 0 4.3 2.848a1.5 1.5 0 0 0-.878.282a.74.74 0 0 0-.287.656a1.34 1.34 0 0 0 .816.967a2.9 2.9 0 0 0 1.406.318l.218-.007c.171-.006.342-.014.519-.008a11.2 11.2 0 0 1 7.09 3.089a17 17 0 0 0-5.127.744c-.8.194-1.6.428-2.376.7l-1.53.528A3.185 3.185 0 0 0 2 13.125v3.764c0 1.145.511 1.452 1.7 1.453l2.187.022a5.007 5.007 0 0 0 8.946.091l5.23.052A1.174 1.174 0 0 0 21.3 17.45a1.175 1.175 0 0 0-1.31-1.15m-7.09-.031a2.52 2.52 0 0 1-1.426 2.152a2.43 2.43 0 0 1-2.22-.023a2.52 2.52 0 0 1-1.388-2.153c0-.032-.009-.063-.009-.1a2.528 2.528 0 1 1 5.055 0c-.002.045-.012.083-.012.124',
   trunk:'m21.548 13.363l-.248-.473l.013-1.291c.005-.206.27-.022.339-.215l.255-.891c.34-.635-.577-1.621-.912-1.557l-3.267-.687a11.4 11.4 0 0 1-1.768-.525l-.267-.1L17.986 5.3a.816.816 0 0 1 1.322.135l.307.377a1.115 1.115 0 0 0 1.582.148a.87.87 0 0 0 .078-1.254l-1.424-1.343a1.574 1.574 0 0 0-2.41 0l-3.67 3.514l-5.249-2.034a5.9 5.9 0 0 0-2.139-.4H3.046a1.046 1.046 0 0 0 0 2.092H6.1a5.4 5.4 0 0 1 1.932.365l7.121 2.758a13.5 13.5 0 0 0 2.035.608l.652.14c.7.152 1.844.126 1.5.759l-.229.436l.017 1.651l.566.993A1.1 1.1 0 0 1 20 15v.585a1.08 1.08 0 0 1-1.08 1.08h-1.152c.013-.129.028-.256.032-.387c0-.045.007-.088.007-.132a5.062 5.062 0 1 0-10.124 0v.085c0 .147.017.29.032.434H3.046a1.047 1.047 0 0 0 0 2.093h5.383a5.027 5.027 0 0 0 8.633 0h2.3c1.509 0 2.613-.681 2.613-2.189L22 14.325a1.8 1.8 0 0 0-.452-.962M10.2 16.238c0-.032-.01-.063-.01-.1a2.551 2.551 0 1 1 5.1 0c0 .041-.01.079-.012.12a2.5 2.5 0 0 1-.053.4a2.55 2.55 0 0 1-1.386 1.773a2.46 2.46 0 0 1-2.24-.023a2.57 2.57 0 0 1-1.4-2.173z'
 };
-function ico(n){ return '<svg class="ic" viewBox="0 0 24 24"><path d="'+IC[n]+'"/></svg>'; }
+const IC_EVENODD={lockClosed:1};
+function ico(n){ const fr=IC_EVENODD[n]?' fill-rule="evenodd"':''; return '<svg class="ic" viewBox="0 0 24 24"><path'+fr+' d="'+IC[n]+'"/></svg>'; }
 let ST={locked:false,clim:false,chg:false,sentry:false,frunkOpen:false,trunkOpen:false};
 function paintToggles(){
   const b=(id,on,ic,onTxt,offTxt)=>{ const e=$(id); if(!e)return; e.innerHTML=ico(ic)+(on?onTxt:offTxt); e.classList.toggle('active',on); };
-  b('btnLock',!ST.locked,'lock','잠금 해제','잠금');
+  b('btnLock',!ST.locked, ST.locked?'lockClosed':'lockOpen', '잠금 해제','잠금');
   b('btnClim',ST.clim,'fan','공조 ON','공조 OFF');
   b('btnChg',ST.chg,'open','충전구 열림','충전구');
   b('btnSentry',ST.sentry,'sentry','감시 ON','감시 OFF');
@@ -1431,17 +1659,35 @@ function etaLabel(mins){
   return day+' '+hh+':'+mm;
 }
 
-// 충전 중이면 충전한도·충전 카드를 목표온도 위로, 아니면 타이어 앞(원위치)으로
+// 충전 중이면 충전 카드를 목표온도 위로, 아니면 타이어 앞(원위치)으로
 function reorderCharging(charging){
-  const limit=$('limitCard'), chg=$('chgcard'), temp=$('tempCard'), tire=$('tireCard');
-  if(!limit||!chg||!temp||!tire) return;
-  const p=limit.parentNode;
+  const chg=$('chgcard'), temp=$('tempCard'), tire=$('tireCard');
+  if(!chg||!temp||!tire) return;
+  const p=chg.parentNode;
   if(charging){
-    if(temp.previousElementSibling!==chg){ p.insertBefore(limit, temp); p.insertBefore(chg, temp); }
+    if(temp.previousElementSibling!==chg) p.insertBefore(chg, temp);
   } else {
-    if(tire.previousElementSibling!==chg){ p.insertBefore(limit, tire); p.insertBefore(chg, tire); }
+    if(tire.previousElementSibling!==chg) p.insertBefore(chg, tire);
   }
 }
+
+// ── 충전한도 드래그 노브 (충전기 연결 시에만) ──
+let limDragging=false, curLimit=80;
+(function(){
+  const knob=$('limknob'); if(!knob) return;
+  const bar=$('socbar').parentNode;   // .bar
+  const pctFromX=(clientX)=>{ const r=bar.getBoundingClientRect();
+    return Math.max(50, Math.min(100, Math.round((clientX-r.left)/r.width*100))); };
+  const place=(p)=>{ curLimit=p; knob.style.left=p+'%'; const t=$('limtxt'); if(t)t.textContent=p; };
+  window.placeLimKnob=place;
+  knob.addEventListener('pointerdown',e=>{ limDragging=true; knob.setPointerCapture(e.pointerId); e.preventDefault(); });
+  knob.addEventListener('pointermove',e=>{ if(limDragging) place(pctFromX(e.clientX)); });
+  const end=e=>{ if(!limDragging)return; limDragging=false; commitLimit(curLimit); };
+  knob.addEventListener('pointerup',end);
+  knob.addEventListener('pointercancel',end);
+})();
+async function commitLimit(p){ toast('충전한도 '+p+'% 설정…');
+  try{ const r=await fetch(q('/api/charge_limit?percent='+p),{method:'POST'}); toast(r.ok?'✅ 한도 '+p+'%':'❌ 실패'); }catch(e){ toast('❌ 연결 실패'); } }
 
 async function refresh(){
   $('updated').textContent='불러오는 중…';
@@ -1455,16 +1701,17 @@ async function refresh(){
     // 배터리/주행
     if(cs.battery_level!=null){ $('soc').textContent=cs.battery_level; $('socbar').style.width=cs.battery_level+'%'; const sp=$('chgspark'); if(sp) sp.style.left=cs.battery_level+'%'; }
     if(cs.battery_range!=null) $('range').textContent=Math.round(cs.battery_range*MI);
-    if(cs.charge_limit_soc!=null){ $('limtxt').textContent=cs.charge_limit_soc; $('limmark').style.left=cs.charge_limit_soc+'%'; $('limslider').value=cs.charge_limit_soc; $('limval').textContent=cs.charge_limit_soc; }
+    if(cs.charge_limit_soc!=null && !limDragging && window.placeLimKnob) window.placeLimKnob(cs.charge_limit_soc);
     if(vs.odometer!=null) $('odo').textContent=Math.round(vs.odometer*MI).toLocaleString();
     if(cl.inside_temp!=null) $('itemp').textContent=cl.inside_temp.toFixed(1);
     if(cl.outside_temp!=null) $('otemp').textContent=cl.outside_temp.toFixed(1);
     if(cl.driver_temp_setting!=null) $('ttemp').textContent=cl.driver_temp_setting.toFixed(0);
-    // 상태
-    let st=[]; st.push(vs.locked?'잠김':'열림'); if(cl.is_climate_on) st.push('공조중');
-    $('state').textContent=st.join(' · ');
     // 충전
     const charging = cs.charging_state==='Charging';
+    const connected = cs.charging_state && cs.charging_state!=='Disconnected';
+    // 충전한도 노브·라벨: 충전기 연결 시에만
+    $('limknob').classList.toggle('on', !!connected);
+    $('limlabel').style.display = connected ? '' : 'none';
     $('chgbadge').textContent = ({Charging:'충전중',Complete:'완료',Stopped:'중지',Disconnected:'미연결',NoPower:'대기'}[cs.charging_state]||cs.charging_state||'–');
     $('chgbadge').className = 'pill'+(charging?' on':'');
     $('chgstate').textContent = charging?('충전중 '+(cs.charger_power||0)+'kW'):(cs.charging_state==='Complete'?'충전 완료':'미충전');
@@ -1579,6 +1826,160 @@ if(!KEY) toast('⚠️ URL에 ?key=토큰 이 필요합니다');
 paintToggles();
 refresh();
 setInterval(refresh,60000);
+
+// ── 분석 그래프 (Canvas) ──
+// 캔버스 폭을 항목수×단위폭으로 잡아 가로 스크롤(모든 라벨 표시). 폰트 추가 20%↑
+function visW(canvas){ return (canvas.parentNode && canvas.parentNode.clientWidth) || 340; }
+function drawLineChart(canvas, points, opts){
+  const ctx = canvas.getContext('2d');
+  const H = canvas.height;
+  const perUnit = opts.perUnit || 46;     // 포인트당 최소 폭
+  const vis = visW(canvas);
+  const W = Math.max(vis, points.length*perUnit);
+  canvas.width = W; canvas.style.width = W+'px';
+  ctx.clearRect(0,0,W,H);
+  if(!points.length){ ctx.fillStyle='#8a8f96'; ctx.font='18px sans-serif'; ctx.fillText('데이터 없음', 20, 34); return; }
+  const pad={l:44,r:16,t:opts.showValues?22:16,b:34};
+  const vals = points.map(p=>p.v);
+  let vmin=Math.min(...vals), vmax=Math.max(...vals);
+  if(opts && opts.ymin!=null) vmin=opts.ymin;
+  if(opts && opts.ymax!=null) vmax=opts.ymax;
+  if(vmax===vmin) vmax=vmin+1;
+  const xW = W-pad.l-pad.r, yH = H-pad.t-pad.b;
+  const x = i => pad.l + xW * (i/(points.length-1||1));
+  const y = v => pad.t + yH - yH * (v-vmin)/(vmax-vmin);
+  ctx.strokeStyle='#2c2f33'; ctx.lineWidth=1;
+  ctx.fillStyle='#8a8f96'; ctx.font='13px sans-serif';
+  for(let g=0;g<=3;g++){
+    const yv = vmin + (vmax-vmin)*g/3, py = y(yv);
+    ctx.beginPath(); ctx.moveTo(pad.l, py); ctx.lineTo(W-pad.r, py); ctx.stroke();
+    ctx.fillText(opts.yFmt?opts.yFmt(yv):yv.toFixed(0), 4, py+5);
+  }
+  ctx.strokeStyle = opts.color||'#2ecc71'; ctx.lineWidth=2; ctx.beginPath();
+  points.forEach((p,i)=>{ const px=x(i), py=y(p.v); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
+  ctx.stroke();
+  ctx.lineTo(x(points.length-1), pad.t+yH); ctx.lineTo(x(0), pad.t+yH); ctx.closePath();
+  ctx.fillStyle = (opts.fill||'rgba(46,204,113,.15)'); ctx.fill();
+  if(opts.showValues){
+    ctx.font='12px sans-serif'; ctx.textAlign='center';
+    points.forEach((p,i)=>{
+      const px=x(i), py=y(p.v);
+      ctx.beginPath(); ctx.arc(px,py,3,0,Math.PI*2); ctx.fillStyle=opts.color||'#2ecc71'; ctx.fill();
+      ctx.fillStyle='#f2f2f2';
+      ctx.fillText(opts.valFmt?opts.valFmt(p.v):Math.round(p.v), px, py-8);
+    });
+  }
+  // x축 라벨 — 폭이 넉넉하므로 전부 표시 (xFmt에 index·배열 전달 → 날짜 경계 표기 가능)
+  ctx.fillStyle='#8a8f96'; ctx.font='13px sans-serif'; ctx.textAlign='center';
+  points.forEach((p,i)=>{
+    ctx.fillText(opts.xFmt?opts.xFmt(p.t,i,points):String(p.t), x(i), H-9);
+  });
+  ctx.textAlign='left';
+  scrollRight(canvas);
+}
+function scrollRight(canvas){ const w=canvas.parentNode; if(w) w.scrollLeft = w.scrollWidth; }
+
+// 한 화면에 약 6개 막대, 나머지는 가로 스크롤
+function drawBarChart(canvas, items, opts){
+  const ctx = canvas.getContext('2d');
+  const H = canvas.height;
+  const vis = visW(canvas);
+  const pad={l:52,r:16,t:18,b:38};
+  const VISN = 6;                                  // 화면에 보일 막대 수
+  const slot = (vis - pad.l - pad.r) / VISN;       // 막대 1개 슬롯 폭
+  const W = Math.max(vis, pad.l + pad.r + slot*items.length);
+  canvas.width = W; canvas.style.width = W+'px';
+  ctx.clearRect(0,0,W,H);
+  if(!items.length){ ctx.fillStyle='#8a8f96'; ctx.font='18px sans-serif'; ctx.fillText('데이터 없음', 20, 34); return; }
+  const yH = H-pad.t-pad.b;
+  const vals = items.map(it=>it.v);
+  const vmax = Math.max(...vals)*1.15 || 1;
+  const bw = slot*0.6, gap = slot*0.4;
+  ctx.strokeStyle='#2c2f33'; ctx.lineWidth=1; ctx.fillStyle='#8a8f96'; ctx.font='13px sans-serif';
+  for(let g=0;g<=3;g++){
+    const yv=vmax*g/3, py=pad.t+yH-yH*g/3;
+    ctx.beginPath(); ctx.moveTo(pad.l,py); ctx.lineTo(W-pad.r,py); ctx.stroke();
+    ctx.fillText(opts.yFmt?opts.yFmt(yv):yv.toFixed(0), 4, py+5);
+  }
+  items.forEach((it,i)=>{
+    const bx = pad.l + slot*i + gap/2;
+    const bh = yH*(it.v/vmax);
+    const by = pad.t + yH - bh;
+    ctx.fillStyle = opts.color||'#e82127';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle='#c8cacb'; ctx.font='13px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(it.lbl, bx+bw/2, H-16);
+    if(opts.topFmt){ ctx.fillStyle='#f2f2f2'; ctx.font='12px sans-serif';
+      ctx.fillText(opts.topFmt(it.v), bx+bw/2, by-5); }
+  });
+  ctx.textAlign='left';
+  scrollRight(canvas);
+}
+
+function setTabActive(prefix, mode){
+  ['hour','day','week','month'].forEach(m=>{
+    const el=document.getElementById(prefix+m.charAt(0).toUpperCase()+m.slice(1));
+    if(el) el.classList.toggle('active', m===mode);
+  });
+}
+
+async function loadBatt(mode){
+  setTabActive('tabBatt', mode);
+  $('battRangeLbl').textContent = (mode==='day'?'일별 (30일)':'시간별 (24시간)');
+  try{
+    const r=await fetch(q('/api/analytics/battery?mode='+mode));
+    const j=await r.json();
+    const pts=j.series.map(p=>({t:p.t, v:p.v}));
+    drawLineChart($('cBatt'), pts, {
+      ymin:0, ymax:100, color:'#2ecc71', fill:'rgba(46,204,113,.2)',
+      yFmt:v=>Math.round(v)+'%',
+      xFmt:(t,i,pts)=>{ const d=new Date(t.replace(' ','T'));
+        if(mode==='day') return (d.getMonth()+1)+'/'+d.getDate();
+        const hh=String(d.getHours()).padStart(2,'0')+':00';
+        // 첫 포인트이거나 날짜가 바뀌면 날짜도 표기
+        if(i===0 || new Date(pts[i-1].t.replace(' ','T')).getDate()!==d.getDate())
+          return (d.getMonth()+1)+'/'+d.getDate()+' '+hh;
+        return hh;
+      },
+      perUnit: mode==='day'?52:56,
+      showValues: true,
+      valFmt: v=>Math.round(v)+'%'
+    });
+  }catch(e){}
+}
+
+async function loadHome(){
+  try{
+    const r=await fetch(q('/api/analytics/home_charge'));
+    const j=await r.json();
+    const items=j.series.map(s=>({lbl:s.month.slice(5)+'월', v:s.cost, kwh:s.kwh}));
+    drawBarChart($('cHome'), items, {color:'#e82127',
+      yFmt:v=>Math.round(v/1000)+'k',
+      topFmt:v=>v.toLocaleString()});
+  }catch(e){}
+}
+
+async function loadDist(mode){
+  setTabActive('tabDist', mode);
+  try{
+    const r=await fetch(q('/api/analytics/distance?mode='+mode));
+    const j=await r.json();
+    const items=j.series.map(s=>{
+      const d=new Date(s.t.replace(' ','T'));
+      let lbl;
+      if(mode==='month') lbl=(d.getMonth()+1)+'월';
+      else if(mode==='week') lbl=(d.getMonth()+1)+'/'+d.getDate();
+      else lbl=(d.getMonth()+1)+'/'+d.getDate();
+      return {lbl, v:s.v};
+    });
+    drawBarChart($('cDist'), items, {color:'#38bdf8',
+      yFmt:v=>Math.round(v)+'km',
+      topFmt:v=>Math.round(v)});
+  }catch(e){}
+}
+
+loadBatt('hour'); loadHome(); loadDist('day');
+setInterval(()=>{loadBatt('hour'); loadHome(); loadDist('day');}, 300000);
 </script>
 </body>
 </html>"""
