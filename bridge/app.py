@@ -342,6 +342,55 @@ async def state(request: Request, vin: str = Query("")):
 
 
 # ── 명령 (프록시 경유, 서명됨) ───────────────────────────────────
+async def _cmd_post(vin: str, at: str, url: str, body: dict, wake: bool = True):
+    """명령 전송. 차가 절전/오프라인이면 깨운 뒤 1회 재시도."""
+    hdr = {"Authorization": f"Bearer {at}"}
+
+    async def once():
+        async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
+            return await c.post(url, headers=hdr, json=body)
+
+    r = await once()
+    txt = ((r.text if r is not None else "") or "").lower()
+    asleep = (r is None or r.status_code != 200
+              or "asleep" in txt or "offline" in txt or "unavailable" in txt)
+    if wake and asleep:
+        try:
+            async with httpx.AsyncClient(timeout=60, verify=PROXY_CA) as c:
+                await c.post(f"{PROXY_BASE}/api/1/vehicles/{vin}/wake_up", headers=hdr)
+                # 깨어날 때까지 최대 30초 대기 (2초 간격 폴링)
+                for _ in range(15):
+                    await asyncio.sleep(2)
+                    try:
+                        s = await c.get(f"{PROXY_BASE}/api/1/vehicles/{vin}", headers=hdr)
+                        if (s.json().get("response") or {}).get("state") == "online":
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        r = await once()
+
+    # 명령이 통했으면 폰 앱에 "지금 상태 다시 읽어라" 신호를 넣는다.
+    # (앱은 notify_pending을 10초마다 확인 → 상태 칩이 2분 기다리지 않고 바로 갱신됨)
+    if r is not None and r.status_code == 200:
+        _nudge_phone()
+        # 차량이 명령을 반영하는 데 몇 초 걸리므로 한 번 더
+        asyncio.create_task(_nudge_phone_later(15))
+    return r
+
+
+def _nudge_phone():
+    """폰 앱 갱신 신호를 큐에 넣는다(중복 방지)."""
+    if "refresh" not in _notify_queue:
+        _notify_queue.append("refresh")
+
+
+async def _nudge_phone_later(delay: float):
+    await asyncio.sleep(delay)
+    _nudge_phone()
+
+
 @app.post("/api/command/{action}")
 async def command(action: str, request: Request, vin: str = Query("")):
     require_bridge_auth(request)
@@ -364,8 +413,8 @@ async def command(action: str, request: Request, vin: str = Query("")):
     except Exception:
         body = {}
 
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    # wake 명령 자체는 재시도 불필요
+    r = await _cmd_post(vin, at, url, body, wake=(endpoint != "__wake__"))
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -376,12 +425,7 @@ async def set_temp(request: Request, vin: str = Query(""), celsius: float = Quer
     vin = vin or DEFAULT_VIN
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_temps"
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(
-            url,
-            headers={"Authorization": f"Bearer {at}"},
-            json={"driver_temp": celsius, "passenger_temp": celsius},
-        )
+    r = await _cmd_post(vin, at, url, {"driver_temp": celsius, "passenger_temp": celsius})
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -391,12 +435,7 @@ async def charge_limit(request: Request, vin: str = Query(""), percent: int = Qu
     vin = vin or DEFAULT_VIN
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_charge_limit"
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(
-            url,
-            headers={"Authorization": f"Bearer {at}"},
-            json={"percent": percent},
-        )
+    r = await _cmd_post(vin, at, url, {"percent": percent})
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -407,8 +446,7 @@ async def trunk(request: Request, vin: str = Query(""), which: str = Query("rear
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/actuate_trunk"
     body = {"which_trunk": "front" if which == "front" else "rear"}
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    r = await _cmd_post(vin, at, url, body)
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -420,8 +458,7 @@ async def seat_heater(request: Request, vin: str = Query(""),
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/remote_seat_heater_request"
     body = {"heater": seat, "level": max(0, min(3, level))}
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json=body)
+    r = await _cmd_post(vin, at, url, body)
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -431,8 +468,7 @@ async def steering_heater(request: Request, vin: str = Query(""), on: bool = Que
     vin = vin or DEFAULT_VIN
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/remote_steering_wheel_heater_request"
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json={"on": on})
+    r = await _cmd_post(vin, at, url, {"on": on})
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -442,8 +478,7 @@ async def sentry(request: Request, vin: str = Query(""), on: bool = Query(True))
     vin = vin or DEFAULT_VIN
     at = await get_access_token()
     url = f"{PROXY_BASE}/api/1/vehicles/{vin}/command/set_sentry_mode"
-    async with httpx.AsyncClient(timeout=30, verify=PROXY_CA) as c:
-        r = await c.post(url, headers={"Authorization": f"Bearer {at}"}, json={"on": on})
+    r = await _cmd_post(vin, at, url, {"on": on})
     return JSONResponse(_safe_json(r), status_code=r.status_code)
 
 
@@ -474,6 +509,7 @@ h2{font-size:18px;margin:8px 0 4px} .muted{color:#8a8f96;font-size:12px;margin-b
 button{display:block;width:100%;padding:16px;margin:8px 0;border:0;border-radius:12px;
   background:#1e1f22;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
 button:active{background:#2a2c30}
+.chip{display:block;margin-top:4px;color:#8a8f96;font-size:12px;font-weight:400}
 #t{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#e82127;color:#fff;
   padding:10px 18px;border-radius:20px;opacity:0;transition:opacity .2s;font-size:14px}
 #t.on{opacity:1}
@@ -482,16 +518,16 @@ button:active{background:#2a2c30}
 <div class="muted">버튼을 누르면 폰 앱이 최대 10초 안에 해당 알림을 띄웁니다.</div>
 <div class="sec">이벤트 알림</div>
 <button onclick="s('sw')">신규 소프트웨어</button>
-<button onclick="s('trunk')">트렁크 열림</button>
-<button onclick="s('frunk')">프렁크 열림</button>
 <button onclick="s('chgdone')">충전 완료 (시간·요금)</button>
-<div class="sec">나우바 / 상시 알림</div>
-<button onclick="s('drive')">운전 중</button>
-<button onclick="s('charge')">충전 중 (완충까지)</button>
-<button onclick="s('hvac')">에어컨 가동 중</button>
-<button onclick="s('hvacdone')">에어컨 완료</button>
-<button onclick="s('sentry')">센트리모드 켜짐</button>
-<button onclick="s('park')">주차 됨</button>
+<button onclick="s('driveend')">주행 종료</button>
+<div class="sec">상태 칩 / 나우바</div>
+<button onclick="s('drive')">운전 중<span class="chip">칩: 02:50 (경과)</span></button>
+<button onclick="s('charge')">충전 중<span class="chip">칩: 00:45 (남은시간)</span></button>
+<button onclick="s('hvac')">에어컨<span class="chip">칩: 00:50 (경과)</span></button>
+<button onclick="s('trunk')">트렁크 열림<span class="chip">칩: 트렁크</span></button>
+<button onclick="s('frunk')">프렁크 열림<span class="chip">칩: 프렁크</span></button>
+<button onclick="s('sentry')">센트리모드<span class="chip">칩: 감시중</span></button>
+<button onclick="s('off')">칩 끄기</button>
 <div id="t"></div>
 <script>
 const KEY=new URLSearchParams(location.search).get('key')||'';
